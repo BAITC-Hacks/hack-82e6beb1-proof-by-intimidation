@@ -26,6 +26,14 @@ def _seed_state() -> dict[str, list[dict[str, Any]]]:
     }
 
 
+def load_drafts() -> list[dict[str, Any]]:
+    return _read_json(DATA_DIR / "drafts.json")
+
+
+def load_demo_card(card_id: str) -> dict[str, Any]:
+    return next((item for item in _read_json(DATA_DIR / "tasks.json") if item["id"] == card_id), {})
+
+
 def load_state() -> dict[str, list[dict[str, Any]]]:
     if RUNTIME_FILE.exists():
         return _read_json(RUNTIME_FILE)

@@ -40,28 +40,32 @@ def _words(text: str) -> set[str]:
 
 def analyze_draft(draft: str) -> dict[str, Any]:
     words = _words(draft)
+    has_substance = len(words) >= 5
     found = []
     missing = []
     for field, hints in FIELD_HINTS.items():
-        if any(any(hint in word for word in words) for hint in hints):
+        if (field in {"context", "need"} and has_substance) or any(any(hint in word for word in words) for hint in hints):
             found.append(field)
         else:
             missing.append(field)
     return {"missing_fields": missing, "detected_fields": found, "draft_length": len(draft.strip())}
 
 
+def fallback_questions(missing_fields: list[str]) -> list[str]:
+    return [QUESTIONS[field] for field in missing_fields if field in QUESTIONS][:5]
+
+
 def propose_questions(missing_fields: list[str], draft: str = "") -> dict[str, Any]:
-    selected = [QUESTIONS[field] for field in missing_fields if field in QUESTIONS][:5]
-    return {"questions": selected, "for_fields": missing_fields[:5]}
+    # Do not expose prewritten question text to the model: it must author questions for this draft.
+    return {"fields_to_clarify": [{"field": field, "label": CARD_FIELDS[field]} for field in missing_fields[:5] if field in CARD_FIELDS]}
 
 
 def build_card(draft: str, answers: dict[str, str]) -> dict[str, Any]:
     card = {field: str(answers.get(field, "")).strip() for field in CARD_FIELDS}
     card["draft"] = draft.strip()
-    card["title"] = card["title"] or "Новая бизнес-задача"
     card["context"] = card["context"] or draft.strip()
-    card["need"] = card["need"] or draft.strip()
-    card["confirmed_fields"] = [field for field, value in card.items() if field in CARD_FIELDS and is_filled(value)]
+    # Only a human may confirm fields and unlock readiness points.
+    card["confirmed_fields"] = []
     return {"card": card, "used_answer_fields": [field for field in answers if is_filled(answers[field])]}
 
 
@@ -71,7 +75,7 @@ def score_card(card: dict[str, Any]) -> dict[str, Any]:
 
 TOOL_SCHEMAS = [
     {"type": "function", "name": "analyze_draft", "description": "Проверяет, каких сведений не хватает в черновике бизнес-задачи.", "parameters": {"type": "object", "properties": {"draft": {"type": "string"}}, "required": ["draft"], "additionalProperties": False}},
-    {"type": "function", "name": "propose_questions", "description": "Формирует уместные вопросы по недостающим полям карточки.", "parameters": {"type": "object", "properties": {"missing_fields": {"type": "array", "items": {"type": "string"}}, "draft": {"type": "string"}}, "required": ["missing_fields"], "additionalProperties": False}},
+    {"type": "function", "name": "propose_questions", "description": "Определяет, по каким полям нужны уточняющие вопросы. После этого сам сформулируй персональные вопросы в финальном JSON, опираясь на черновик.", "parameters": {"type": "object", "properties": {"missing_fields": {"type": "array", "items": {"type": "string"}}, "draft": {"type": "string"}}, "required": ["missing_fields"], "additionalProperties": False}},
     {"type": "function", "name": "build_card", "description": "Собирает редактируемую карточку только из черновика и ответов пользователя.", "parameters": {"type": "object", "properties": {"draft": {"type": "string"}, "answers": {"type": "object", "additionalProperties": {"type": "string"}}}, "required": ["draft", "answers"], "additionalProperties": False}},
     {"type": "function", "name": "score_card", "description": "Рассчитывает прозрачный рейтинг готовности 0-100.", "parameters": {"type": "object", "properties": {"card": {"type": "object"}}, "required": ["card"], "additionalProperties": False}},
 ]
