@@ -5,6 +5,8 @@ from __future__ import annotations
 import importlib
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
+from time import monotonic, sleep
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -145,7 +147,9 @@ def test_edit_recalculates_and_rejects_stale_version(client):
     assert client.get(f"/api/challenges/{task['id']}").json()["title"] == "Updated catalog task"
 
 
-@pytest.mark.parametrize("link", ["javascript:alert(1)", "file:///etc/passwd", "https://user:password@example.com", "not a url"])
+@pytest.mark.parametrize("link", ["javascript:alert(1)", "file:///etc/passwd", "https://user:password@example.com", "not a url",
+                                  "https://example.com:not-a-port/prototype", "https://example.com:99999/", "https://example.com:0/",
+                                  "https://example.com/proto\u0000type"])
 def test_unsafe_prototype_links_are_rejected(client, link):
     assert propose(client, "t4", link=link).status_code == 422
 
@@ -319,3 +323,282 @@ def test_curated_seed_ratings_match_evidence_and_varied_expected_scores(tmp_path
     with transaction(path) as db:
         actual = {row["id"]: row["score"] for row in db.execute("SELECT id,score FROM challenges")}
     assert actual == expected
+
+
+def test_private_draft_review_and_proposals_never_enter_public_views(app, client, monkeypatch):
+    marker = "PRIVATE-NOTE-123"
+    review = [{"key": "context", "weight": 20, "level": 4, "points": 20,
+               "evidence": marker, "reason": marker, "next_step": marker}]
+    monkeypatch.setattr(api, "analyze_brief", lambda *args, **kwargs: {
+        "fields": FIELDS, "criteria": review, "mode": "ai", "trace": [{"private": marker}],
+    })
+    analysis = client.post("/api/analyze", json={"draft": "Library task " + marker, "offline": True}).json()
+    task = create_challenge(client, draft="Library task " + marker, analysis_id=analysis["analysis_id"]).json()
+    propose(client, task["id"], idea="Our private team proposal " + marker)
+    assert marker in client.get(f"/api/challenges/{task['id']}").text
+    # Even the creator's bootstrap never includes private payloads.
+    assert marker not in client.get("/api/bootstrap").text
+    with TestClient(app) as visitor:
+        detail = visitor.get(f"/api/challenges/{task['id']}")
+        assert detail.status_code == 200 and marker not in detail.text
+        assert "draft" not in detail.json() and detail.json()["proposals"] == []
+        assert detail.json()["proposal_count"] == 1
+        assert marker not in visitor.get("/api/bootstrap").text
+
+
+def test_partial_edit_validates_merged_card_total(client):
+    fields = {key: "a" * 2600 for key in FIELDS}
+    fields["title"] = "Long but valid task"
+    task = create_challenge(client, fields=fields).json()
+    result = client.patch(f"/api/challenges/{task['id']}", json={
+        "fields": {"context": "b" * 4000}, "confirmed": True, "version": 1,
+    })
+    assert result.status_code == 422 and "24 000" in result.json()["detail"]
+    assert client.get(f"/api/challenges/{task['id']}").json()["version"] == 1
+
+
+def test_summary_payload_is_bounded_and_stats_do_not_require_proposal_bodies(client):
+    task = create_challenge(client, fields={**FIELDS, "context": "a" * 4000}).json()
+    for _ in range(12):
+        assert propose(client, task["id"], idea="Large proposal " + "z" * 5900).status_code == 201
+    response = client.get("/api/bootstrap").json()
+    summary = next(item for item in response["challenges"] if item["id"] == task["id"])
+    assert summary["summary"] and summary["proposal_count"] == 12
+    assert len(summary["fields"]["context"]) == 500
+    assert not {"draft", "criteria", "proposals", "progress"}.intersection(summary)
+    assert response["stats"]["proposals"] == 17
+
+
+def job_payload(**overrides):
+    return {"draft": "Students cannot find Kazakh library textbooks.", "answers": {},
+            "language": "en", "offline": False, "request_id": str(uuid4()), **overrides}
+
+
+def await_job(client, identifier, timeout=5):
+    deadline = monotonic() + timeout
+    while monotonic() < deadline:
+        result = client.get(f"/api/analysis-jobs/{identifier}")
+        assert result.status_code == 200
+        body = result.json()
+        if body["status"] in {"succeeded", "failed"}:
+            return body
+        sleep(0.01)
+    raise AssertionError("Background analysis did not finish within the test deadline")
+
+
+def test_analysis_job_survives_refresh_is_private_and_idempotent(app, client, monkeypatch):
+    calls = []
+    monkeypatch.setattr(api, "analyze_brief", lambda *args, **kwargs: calls.append(args) or {
+        "fields": FIELDS, "criteria": [{"key": "context", "weight": 20, "level": 4, "points": 20}], "mode": "ai",
+    })
+    payload = job_payload()
+    created = client.post("/api/analysis-jobs", json=payload)
+    assert created.status_code == 202
+    identifier = created.json()["job_id"]
+    completed = await_job(client, identifier)
+    assert completed["status"] == "succeeded"
+    assert completed["analysis"]["analysis_id"]
+    assert len(calls) == 1
+    recovered = client.post("/api/analysis-jobs", json=payload)
+    assert recovered.status_code == 202 and recovered.json() == completed
+    assert len(calls) == 1
+    with TestClient(app) as visitor:
+        assert visitor.get(f"/api/analysis-jobs/{identifier}").status_code == 404
+    with TestClient(app) as refreshed:
+        refreshed.cookies.update(client.cookies)
+        assert refreshed.get(f"/api/analysis-jobs/{identifier}").json() == completed
+    with TestClient(api.create_app(app.state.database_path)) as restarted:
+        restarted.cookies.update(client.cookies)
+        assert restarted.get(f"/api/analysis-jobs/{identifier}").json() == completed
+    mismatch = client.post("/api/analysis-jobs", json={**payload, "draft": "A different business problem requires attention."})
+    assert mismatch.status_code == 409
+    published = create_challenge(client, analysis_id=completed["analysis"]["analysis_id"])
+    assert published.status_code == 201 and published.json()["score_source"] == "ai"
+
+
+def test_job_errors_are_sanitized_and_explicit_retry_uses_new_id(client, monkeypatch):
+    calls = []
+
+    def broken(*args, **kwargs):
+        calls.append(1)
+        raise RuntimeError("SECRET-USER-PAYLOAD provider headers Authorization xyz")
+
+    monkeypatch.setattr(api, "analyze_brief", broken)
+    payload = job_payload()
+    result = client.post("/api/analysis-jobs", json=payload).json()
+    failed = await_job(client, result["job_id"])
+    assert failed["status"] == "failed" and failed["error"]["diagnostic_id"]
+    assert "SECRET" not in str(failed) and "офлайн" in failed["error"]["detail"]
+    assert client.post("/api/analysis-jobs", json=payload).json() == failed
+    assert len(calls) == 1
+    retried = client.post("/api/analysis-jobs", json={**payload, "request_id": str(uuid4())}).json()
+    assert retried["job_id"] != failed["job_id"]
+    assert await_job(client, retried["job_id"])["status"] == "failed" and len(calls) == 2
+
+
+def test_jobs_share_actor_limit_with_sync_analysis_and_retry_is_safe(app, client, monkeypatch):
+    started, finish = Event(), Event()
+
+    def slow(*args, **kwargs):
+        started.set()
+        assert finish.wait(5)
+        return {"mode": "ai", "fields": FIELDS}
+
+    monkeypatch.setattr(api, "analyze_brief", slow)
+    payload = job_payload()
+    queued = client.post("/api/analysis-jobs", json=payload).json()
+    try:
+        assert started.wait(2)
+        repeat = client.post("/api/analysis-jobs", json=payload)
+        assert repeat.status_code == 202 and repeat.json()["job_id"] == queued["job_id"]
+        second = client.post("/api/analysis-jobs", json={**payload, "request_id": str(uuid4())})
+        assert second.status_code == 429 and int(second.headers["Retry-After"]) > 0
+        sync = client.post("/api/analyze", json={key: value for key, value in payload.items() if key != "request_id"})
+        assert sync.status_code == 429
+    finally:
+        finish.set()
+    assert await_job(client, queued["job_id"])["status"] == "succeeded"
+
+
+def test_jobs_have_bounded_global_concurrency_and_capacity(app, client, monkeypatch):
+    from threading import Lock
+    finish, lock = Event(), Lock()
+    active = [0, 0]
+
+    def slow(*args, **kwargs):
+        with lock:
+            active[0] += 1
+            active[1] = max(active)
+        try:
+            assert finish.wait(5)
+            return {"mode": "offline", "fields": FIELDS}
+        finally:
+            with lock:
+                active[0] -= 1
+
+    monkeypatch.setattr(api, "analyze_brief", slow)
+    identifiers = []
+    try:
+        for _ in range(8):
+            response = client.post("/api/analysis-jobs", json=job_payload(offline=True))
+            assert response.status_code == 202
+            identifiers.append(response.json()["job_id"])
+        full = client.post("/api/analysis-jobs", json=job_payload(offline=True))
+        assert full.status_code == 429 and "Retry-After" in full.headers
+        assert active[1] <= 2
+    finally:
+        finish.set()
+    assert all(await_job(client, identifier)["status"] == "succeeded" for identifier in identifiers)
+
+
+def test_restart_marks_abandoned_jobs_failed_and_preserves_completed(tmp_path, monkeypatch):
+    import hashlib
+    from server.database import encode, initialize, now, transaction
+    path = tmp_path / "restart-jobs.sqlite3"
+    monkeypatch.setattr(api, "score_card_fields", fake_score)
+    initialize(path, fake_score)
+    token = "a" * 64
+    owner = hashlib.sha256(token.encode()).hexdigest()
+    identifiers = [str(uuid4()), str(uuid4())]
+    with transaction(path) as db:
+        for identifier, status in zip(identifiers, ["queued", "running"]):
+            db.execute("""INSERT INTO analysis_jobs
+                (id,owner,request_id,input_hash,input_json,status,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?)""", (identifier, owner, identifier, "hash", encode(job_payload()), status, now(), now()))
+    with TestClient(api.create_app(path)) as browser:
+        browser.cookies.set(api.COOKIE, token)
+        for identifier in identifiers:
+            result = browser.get(f"/api/analysis-jobs/{identifier}").json()
+            assert result["status"] == "failed" and result["error"]["code"] == "server_restarted"
+            assert "перезапущен" in result["error"]["detail"]
+
+
+def test_owner_can_reject_all_teams_without_assignment(client):
+    task = create_challenge(client).json()
+    proposals = [propose(client, task["id"], team_id=f"team{index}").json() for index in (1, 2, 3)]
+    for proposal in proposals:
+        assert proposal["status"] == "submitted"
+        assert client.patch(f"/api/proposals/{proposal['id']}", json={"status": "rejected"}).status_code == 200
+    detail = client.get(f"/api/challenges/{task['id']}").json()
+    assert all(item["status"] == "rejected" and item["points"] == 0 for item in detail["proposals"])
+    assert detail["progress"] == []
+
+
+@pytest.mark.parametrize("language,draft", [
+    ("ru", "Студенты не находят учебники на казахском языке в каталоге библиотеки."),
+    ("kk", "Студенттер кітапхана каталогынан қазақ тіліндегі оқулықтарды таба алмайды."),
+    ("en", "Students cannot find Kazakh textbooks in the library catalog."),
+])
+def test_real_offline_three_complete_scenarios(tmp_path, language, draft):
+    # Real domain engine, explicitly offline. No mock grades or provider calls.
+    with TestClient(api.create_app(tmp_path / f"journey-{language}.sqlite3")) as browser:
+        weak = browser.post("/api/analyze", json={"draft": draft, "language": language, "offline": True})
+        assert weak.status_code == 200
+        first = weak.json()
+        assert first["mode"] == "offline" and len(first["questions"]) >= 3
+        job = browser.post("/api/analysis-jobs", json=job_payload(draft=draft, language=language, answers=FIELDS, offline=True)).json()
+        outcome = await_job(browser, job["job_id"])
+        assert outcome["status"] == "succeeded"
+        analysis = outcome["analysis"]
+        assert first["score"] < analysis["score"] <= 27
+        published = create_challenge(browser, draft=draft, language=language, fields=analysis["fields"], analysis_id=analysis["analysis_id"])
+        assert published.status_code == 201
+        task = published.json()
+        assert task["score"] == analysis["score"] and task["score_source"] == "local"
+        assert any(card["id"] == task["id"] for card in browser.get("/api/bootstrap").json()["challenges"])
+        proposal = propose(browser, task["id"], team_id=None, team_name="Independent student team").json()
+        assert proposal["status"] == "submitted"
+        assert browser.patch(f"/api/proposals/{proposal['id']}", json={"status": "accepted"}).status_code == 200
+        award = browser.post(f"/api/proposals/{proposal['id']}/milestones", json={
+            "title": "Human-reviewed prototype", "evidence": "The business reviewed ten catalog search results in the shared prototype.",
+        })
+        assert award.status_code == 201 and award.json()["points"] == 10
+
+
+def test_synchronous_analysis_cannot_bypass_global_job_limit(app, client, monkeypatch):
+    from threading import Lock
+    running, lock, finish = Event(), Lock(), Event()
+    count = [0]
+
+    def slow(*args, **kwargs):
+        with lock:
+            count[0] += 1
+            if count[0] == 2:
+                running.set()
+        assert finish.wait(5)
+        return {"mode": "offline"}
+
+    monkeypatch.setattr(api, "analyze_brief", slow)
+    jobs = [client.post("/api/analysis-jobs", json=job_payload(offline=True)).json() for _ in range(2)]
+    try:
+        assert running.wait(2)
+        with TestClient(app) as different_browser:
+            response = different_browser.post("/api/analyze", json={
+                "draft": "Another browser cannot bypass the shared concurrency ceiling.", "offline": True,
+            })
+            assert response.status_code == 429 and response.headers["Retry-After"] == "5"
+    finally:
+        finish.set()
+    assert all(await_job(client, job["job_id"])["status"] == "succeeded" for job in jobs)
+
+
+def test_ai_error_codes_and_stage_are_preserved_safely(client, monkeypatch):
+    from agent.architect import AnalysisUnavailable
+
+    def invalid(*args, **kwargs):
+        raise AnalysisUnavailable("Untrusted body SECRET", code="validation_failed", stage="audit")
+
+    monkeypatch.setattr(api, "analyze_brief", invalid)
+    job = client.post("/api/analysis-jobs", json=job_payload()).json()
+    result = await_job(client, job["job_id"])
+    assert result["error"]["code"] == "validation_failed" and result["error"]["stage"] == "audit"
+    assert "проверку фактов" in result["error"]["detail"] and "SECRET" not in str(result)
+
+
+def test_legacy_analysis_unexpected_failure_is_sanitized(client, monkeypatch):
+    def unexpected(*args, **kwargs):
+        raise RuntimeError("SECRET prompt and provider Authorization body")
+    monkeypatch.setattr(api, "analyze_brief", unexpected)
+    response = client.post("/api/analyze", json={"draft": "Library students cannot find the textbooks."})
+    assert response.status_code == 503 and "SECRET" not in response.text
+    assert "офлайн" in response.json()["detail"]

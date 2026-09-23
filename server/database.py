@@ -81,6 +81,15 @@ def initialize(path: Path, score_fields: Any) -> None:
                 id TEXT PRIMARY KEY, owner TEXT NOT NULL,
                 analysis_json TEXT NOT NULL, created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS analysis_jobs (
+                id TEXT PRIMARY KEY, owner TEXT NOT NULL, request_id TEXT,
+                input_hash TEXT NOT NULL, input_json TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('queued','running','succeeded','failed')),
+                analysis_id TEXT REFERENCES analyses(id), error_json TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                UNIQUE(owner, request_id)
+            );
+            CREATE INDEX IF NOT EXISTS challenges_ranking ON challenges(score DESC, created_at DESC, id);
         """)
         columns = {row["name"] for row in db.execute("PRAGMA table_info(challenges)")}
         if "score_source" not in columns:
@@ -132,17 +141,75 @@ def proposal_view(db: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
     return result
 
 
-def challenge_view(db: sqlite3.Connection, row: sqlite3.Row, actor: str) -> dict[str, Any]:
-    result = dict(row)
+def challenge_metadata(row: sqlite3.Row, actor: str) -> dict[str, Any]:
+    # Public responses are explicit allowlists: future storage columns stay private.
+    result = {key: row[key] for key in (
+        "id", "title", "topic", "score", "readiness", "created_at", "updated_at",
+        "version", "score_source",
+    )}
     result["source"] = "sample" if row["owner"] == "seed" else "confirmed"
-    result["analysis_fields_changed"] = bool(result["analysis_fields_changed"])
-    result["is_owner"] = result.pop("owner") == actor
-    result["fields"] = json.loads(result.pop("fields_json"))
-    result["criteria"] = json.loads(result.pop("criteria_json"))
-    result["proposals"] = [proposal_view(db, item) for item in db.execute(
+    result["analysis_fields_changed"] = bool(row["analysis_fields_changed"])
+    result["is_owner"] = row["owner"] == actor
+    return result
+
+
+def catalog_view(db: sqlite3.Connection, actor: str) -> list[dict[str, Any]]:
+    # One set-based query, with bounded display excerpts, regardless of proposal count.
+    rows = db.execute("""
+        SELECT c.id,c.owner,c.title,c.topic,c.score,c.readiness,c.created_at,c.updated_at,
+               c.version,c.score_source,c.analysis_fields_changed,
+               json_object('title',c.title,
+                   'context',substr(json_extract(c.fields_json,'$.context'),1,500),
+                   'need',substr(json_extract(c.fields_json,'$.need'),1,500),
+                   'expected_result',substr(json_extract(c.fields_json,'$.expected_result'),1,500)) AS display_fields,
+               coalesce(p.total,0) AS proposal_count
+        FROM challenges c LEFT JOIN (
+            SELECT challenge_id,count(*) AS total FROM proposals GROUP BY challenge_id
+        ) p ON p.challenge_id=c.id
+        ORDER BY c.score DESC,c.created_at DESC,c.id
+    """)
+    return [{**challenge_metadata(row, actor), "summary": True,
+             "fields": json.loads(row["display_fields"]), "proposal_count": row["proposal_count"]}
+            for row in rows]
+
+
+def public_criteria(criteria: list[dict[str, Any]], fields: dict[str, str]) -> list[dict[str, Any]]:
+    # AI rationale can mention a private source even when its rated fields are public.
+    # Expose scores and only quotes verifiable against the confirmed card, never that prose.
+    confirmed = "\n".join(fields.values())
+    result = []
+    for criterion in criteria:
+        item = {key: criterion[key] for key in ("key", "label", "weight", "level", "points") if key in criterion}
+        evidence = criterion.get("evidence", "")
+        item["evidence"] = evidence if isinstance(evidence, str) and evidence in confirmed else ""
+        item.update(reason="", next_step="")
+        result.append(item)
+    return result
+
+
+def challenge_view(db: sqlite3.Connection, row: sqlite3.Row, actor: str) -> dict[str, Any]:
+    result = challenge_metadata(row, actor)
+    result["summary"] = False
+    stored_fields = json.loads(row["fields_json"])
+    result["fields"] = {key: stored_fields.get(key, "") for key in CARD_FIELDS}
+    criteria = json.loads(row["criteria_json"])
+    result["criteria"] = criteria if result["is_owner"] else public_criteria(criteria, result["fields"])
+    result["proposal_count"] = db.execute(
+        "SELECT count(*) FROM proposals WHERE challenge_id=?", (row["id"],)
+    ).fetchone()[0]
+    result["proposals"], result["progress"] = [], []
+    if not result["is_owner"]:
+        # Team ideas and human milestone evidence are sent to the business, not the catalog.
+        return result
+    result["draft"] = row["draft"]
+    proposals = db.execute(
         "SELECT * FROM proposals WHERE challenge_id = ? ORDER BY created_at DESC, id", (row["id"],)
-    ).fetchall()]
-    result["proposal_count"] = len(result["proposals"])
+    ).fetchall()
+    milestones = {item["proposal_id"]: dict(item) for item in db.execute(
+        """SELECT m.* FROM milestones m JOIN proposals p ON p.id=m.proposal_id
+           WHERE p.challenge_id=?""", (row["id"],)
+    )}
+    result["proposals"] = [{**dict(item), "milestone": milestones.get(item["id"])} for item in proposals]
     result["progress"] = [
         {**proposal["milestone"], "team_name": proposal["team_name"], "team_id": proposal["team_id"]}
         for proposal in result["proposals"] if proposal["milestone"]

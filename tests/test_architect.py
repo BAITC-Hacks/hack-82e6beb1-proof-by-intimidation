@@ -11,6 +11,7 @@ from agent.architect import (
     score_card_fields, validate_analysis,
 )
 from agent.architect_tools import FIELDS, RUBRIC, get_rubric, verify_quotes
+from agent.evidence import original_quote, resolve_spans, source_passages
 
 
 DRAFT = "Library students cannot find Kazakh-language textbooks in the existing catalog."
@@ -39,6 +40,35 @@ def test_grounded_contract_and_question_points():
     assert len(result["criteria"]) == 7
     assert sum(item["weight"] for item in result["criteria"]) == 100
     assert result["questions"][1]["max_points"] == 15
+
+
+def test_non_task_cannot_earn_points_but_original_words_are_preserved():
+    raw = valid_result()
+    raw["task_present"] = False
+    result = validate_analysis(raw, DRAFT, {}, "en")
+    assert result["score"] == 0
+    assert result["fields"]["context"] == DRAFT
+    assert result["task_present"] is False
+
+
+@pytest.mark.parametrize("status", ["missing", "unknown", "irrelevant", "contradictory", "unverifiable"])
+def test_authentic_but_unusable_information_cannot_earn_points(status):
+    raw = valid_result()
+    raw["criteria"][0].update(status=status, level=4)
+    result = validate_analysis(raw, DRAFT, {}, "en")
+    assert result["criteria"][0]["level"] == 0
+    assert result["score"] == 0
+
+
+def test_task_and_criterion_eligibility_flags_are_validated():
+    raw = valid_result()
+    raw["task_present"] = "false"
+    with pytest.raises(AnalysisValidationError, match="boolean"):
+        validate_analysis(raw, DRAFT, {}, "en")
+    raw["task_present"] = True
+    raw["criteria"][0]["status"] = "looks fine"
+    with pytest.raises(AnalysisValidationError, match="status"):
+        validate_analysis(raw, DRAFT, {}, "en")
 
 
 def test_missing_redundant_evidence_is_derived_from_verified_fields():
@@ -102,11 +132,13 @@ def test_offline_preserves_explicitly_cleared_title_and_context():
     assert result["score"] == 0
 
 
-def test_answer_cannot_be_assigned_to_unrelated_field():
+def test_cross_answer_passages_can_supply_a_second_relevant_field():
     raw = valid_result()
-    raw["fields"]["constraints"] = "We can export catalog records."
-    with pytest.raises(AnalysisValidationError):
-        validate_analysis(raw, DRAFT, {"data": "We can export catalog records."})
+    answer = "Contact mentor@example.org. We meet online every Friday."
+    raw["fields"].update(contact=answer, interaction_format="We meet online every Friday.")
+    result = validate_analysis(raw, DRAFT, {"contact": answer}, "en")
+    assert result["fields"]["interaction_format"] == "We meet online every Friday."
+    assert {"field": "interaction_format", "quote": "We meet online every Friday.", "source": "answers.contact"} in result["evidence"]
 
 
 def test_wrong_score_evidence_is_rejected():
@@ -123,10 +155,11 @@ def test_duplicate_questions_are_rejected():
         validate_analysis(raw, DRAFT, {})
 
 
-def test_quote_verification_is_exact_and_field_scoped():
+def test_quote_verification_is_source_scoped_not_destination_scoped():
     sources = {"draft": DRAFT, "answers.contact": "mentor@example.org"}
     assert verify_quotes([{"field": "context", "source": "draft", "quote": "Kazakh-language textbooks"}], sources)["valid"]
-    assert not verify_quotes([{"field": "data", "source": "answers.contact", "quote": "mentor@example.org"}], sources)["valid"]
+    assert verify_quotes([{"field": "contact", "source": "answers.contact", "quote": "mentor@example.org"}], sources)["valid"]
+    assert not verify_quotes([{"field": "contact", "source": "answers.unknown", "quote": "mentor@example.org"}], sources)["valid"]
     assert not verify_quotes([{"field": "context", "source": "draft", "quote": "kazakh-language textbooks"}], sources)["valid"]
     assert verify_quotes([{"field": "context", "source": "draft", "quote": '"Kazakh-language textbooks"'}], sources)["valid"]
     assert verify_quotes([{"field": "data", "source": "draft", "quote": ""}], sources) == {"valid": True, "checks": []}
@@ -199,14 +232,14 @@ def test_model_selects_tools_and_receives_their_results():
         SimpleNamespace(type="function_call", name="verify_user_evidence", arguments=json.dumps({"claims": raw["evidence"]}), call_id="evidence"),
     ]
     requests = []
-    responses = iter([SimpleNamespace(output=calls, output_text=""), SimpleNamespace(output=[], output_text=json.dumps(raw))])
+    responses = iter([SimpleNamespace(output=calls, output_text=""), SimpleNamespace(output=[], output_text=json.dumps(raw)), SimpleNamespace(output=[], output_text=json.dumps(raw))])
     def create(**kwargs):
         requests.append(copy.deepcopy(kwargs))
         return next(responses)
     client = SimpleNamespace(responses=SimpleNamespace(create=create))
     result = _run(client, "test-model", DRAFT, {}, "en")
     assert result["mode"] == "ai"
-    assert len(requests) == 2
+    assert len(requests) == 3  # Tool round, candidate, bounded semantic audit.
     outputs = [item for item in requests[1]["input"] if isinstance(item, dict) and item.get("type") == "function_call_output"]
     assert {item["call_id"] for item in outputs} == {"rubric", "evidence"}
     assert result["trace"][0]["tool"] == "get_readiness_rubric"
@@ -240,3 +273,219 @@ def test_rubric_has_seven_business_criteria():
     rubric = get_rubric("kk")
     assert len(rubric["criteria"]) == 7
     assert sum(item["weight"] for item in rubric["criteria"]) == 100
+
+
+def test_whitespace_mapping_preserves_original_characters():
+    source = "Constraints:\n- no student names;\n- two weeks."
+    assert original_quote("Constraints: - no student names; - two weeks.", source) == source
+    assert original_quote("Constraints: no student names; two weeks.", source) is None
+
+
+def test_disjoint_passages_are_individually_grounded():
+    source = "We need a paper checklist. Data lives in CSV. No names may be collected."
+    spans = resolve_spans("We need a paper checklist.\nNo names may be collected.", {"draft": source})
+    assert [item["quote"] for item in spans] == ["We need a paper checklist.", "No names may be collected."]
+    with pytest.raises(ValueError):
+        resolve_spans("We need a paper checklist and no names may be collected.", {"draft": source})
+
+
+@pytest.mark.parametrize("source,quote", [
+    ("Do not collect student names.", "collect student names"),
+    ("We do not\ncollect student names.", "collect student names"),
+    ("We cannot collect phone numbers.", "collect phone numbers"),
+    ("We mustn't collect student names.", "collect student names"),
+    ("Запрещено собирать телефоны.", "собирать телефоны"),
+    ("Сбор телефонов запрещён.", "Сбор телефонов"),
+    ("Нельзя собирать телефоны студентов.", "собирать телефоны студентов"),
+    ("Не используйте персональные данные.", "используйте персональные данные"),
+    ("Автоматты бағалау қажет емес.", "Автоматты бағалау"),
+])
+def test_excerpts_must_not_cut_away_negative_qualifier(source, quote):
+    with pytest.raises(ValueError):
+        resolve_spans(quote, {"draft": source})
+    assert resolve_spans(source, {"draft": source})[0]["quote"] == source
+
+
+def test_explicit_clear_wins_even_over_a_compound_answer():
+    raw = valid_result()
+    answer = "Contact mentor@example.org. We meet every Friday."
+    raw["fields"].update(contact=answer, interaction_format="We meet every Friday.")
+    with pytest.raises(AnalysisValidationError, match="preserve"):
+        validate_analysis(raw, DRAFT, {"contact": answer, "interaction_format": ""}, "en")
+
+
+def test_multispan_field_retains_each_original_source():
+    raw = valid_result()
+    draft = DRAFT + " No student names may be collected."
+    answer = "We need the checklist within two weeks."
+    raw["fields"].update(need=answer, constraints="No student names may be collected.\nWe need the checklist within two weeks.")
+    result = validate_analysis(raw, draft, {"need": answer}, "en")
+    quotes = [item for item in result["evidence"] if item["field"] == "constraints"]
+    assert len(quotes) == 2
+    assert {item["source"] for item in quotes} == {"draft", "answers.need"}
+
+
+def test_long_offline_draft_does_not_exceed_card_field_limit():
+    draft = "This is a supplied business situation. " * 160
+    result = analyze_brief(draft, offline=True, language="en")
+    assert len(result["fields"]["context"]) == 4000
+    assert result["fields"]["context"] == draft[:4000]
+    assert len(result["warnings"]) == 2
+
+
+def test_safe_diagnostic_metadata_does_not_contain_source():
+    error = AnalysisUnavailable("A safe message", code="validation_failed", stage="audit")
+    assert error.code == "validation_failed"
+    assert error.stage == "audit"
+    assert len(error.diagnostic_id) == 12
+
+
+def test_failed_preliminary_quotes_do_not_discard_valid_final_card():
+    good = valid_result()
+    calls = [SimpleNamespace(type="function_call", name=name, arguments=json.dumps(args), call_id=name)
+             for name, args in [("get_readiness_rubric", {}), ("verify_user_evidence", {"claims": [{"field": "data", "quote": "Invented", "source": "draft"}]})]]
+    response = SimpleNamespace(output=[], output_text=json.dumps(good))
+    responses = iter([SimpleNamespace(output=calls, output_text=""), response, response, response, response])
+    result = _run(SimpleNamespace(responses=SimpleNamespace(create=lambda **kwargs: next(responses))), "test-model", DRAFT, {}, "en")
+    assert result["fields"]["context"] == DRAFT
+    assert any(item["tool"] == "semantic_audit" for item in result["trace"])
+
+
+def test_a_second_invalid_repair_is_not_retried_indefinitely():
+    bad = valid_result()
+    bad["fields"]["data"] = "Invented information"
+    calls = [SimpleNamespace(type="function_call", name=name, arguments=json.dumps(args), call_id=name)
+             for name, args in [("get_readiness_rubric", {}), ("verify_user_evidence", {"claims": []})]]
+    requests = []
+    responses = iter([SimpleNamespace(output=calls, output_text=""), SimpleNamespace(output=[], output_text=json.dumps(bad)), SimpleNamespace(output=[], output_text=json.dumps(bad))])
+    def create(**kwargs):
+        requests.append(kwargs)
+        return next(responses)
+    with pytest.raises(AnalysisValidationError, match="repair_failed"):
+        _run(SimpleNamespace(responses=SimpleNamespace(create=create)), "test-model", DRAFT, {}, "en")
+    assert len(requests) == 3
+
+
+def coverage_result(draft, answers=None, assignment=None):
+    raw = valid_result()
+    raw.pop("fields")
+    raw.pop("evidence")
+    raw["title"] = ""
+    passages = source_passages({"draft": draft, **{f"answers.{key}": value for key, value in (answers or {}).items()}})
+    raw["coverage"] = [{"source_id": item["id"], "fields": (assignment or {}).get(item["id"], ["context"])} for item in passages]
+    raw["contradictions"] = []
+    for criterion in raw["criteria"]:
+        criterion.pop("evidence")
+        criterion["level"] = 0
+    return raw
+
+
+def test_passage_id_grounding_preserves_negative_clause_without_model_retyping():
+    draft = "Teachers review essays. Автоматты бағалау қажет емес."
+    raw = coverage_result(draft, assignment={"s1": ["context", "users"], "s2": ["constraints"]})
+    result = validate_analysis(raw, draft, {}, "en")
+    assert result["fields"]["users"] == "Teachers review essays."
+    assert result["fields"]["constraints"] == "Автоматты бағалау қажет емес."
+    assert verify_quotes(result["evidence"], {"draft": draft})["valid"]
+
+
+def test_coverage_cannot_silently_skip_or_invent_passages():
+    raw = coverage_result(DRAFT)
+    raw["coverage"] = []
+    with pytest.raises(AnalysisValidationError, match="every source"):
+        validate_analysis(raw, DRAFT, {}, "en")
+    raw["coverage"] = [{"source_id": "unknown", "fields": ["data"]}]
+    with pytest.raises(AnalysisValidationError, match="unknown"):
+        validate_analysis(raw, DRAFT, {}, "en")
+
+
+def test_coverage_cross_answer_and_authoritative_clear():
+    answer = "Contact mentor@example.org. Meet every Friday."
+    answers = {"contact": answer, "interaction_format": ""}
+    raw = coverage_result(DRAFT, answers, {"s1": ["context"], "s2": ["contact"], "s3": ["interaction_format"]})
+    result = validate_analysis(raw, DRAFT, answers, "en")
+    assert result["fields"]["contact"] == answer
+    assert result["fields"]["interaction_format"] == ""
+    answers.pop("interaction_format")
+    result = validate_analysis(raw, DRAFT, answers, "en")
+    assert result["fields"]["interaction_format"] == "Meet every Friday."
+
+
+def test_source_supported_conflict_forces_only_affected_criterion_zero():
+    draft = "The report is due tomorrow. The data arrives next week."
+    raw = coverage_result(draft, assignment={"s1": ["context", "constraints"], "s2": ["constraints", "data"]})
+    raw["contradictions"] = [{"source_ids": ["s1", "s2"], "criteria": ["constraints"], "description": "The data arrives after the report deadline."}]
+    for item in raw["criteria"]:
+        if item["key"] in {"data", "constraints"}:
+            item["level"] = 3
+            item["next_step"] = "No action needed; the conditions are complete."
+    result = validate_analysis(raw, draft, {}, "en")
+    assert next(item["points"] for item in result["criteria"] if item["key"] == "constraints") == 0
+    assert next(item["points"] for item in result["criteria"] if item["key"] == "data") == 15
+    assert "Resolve the stated conflict" in next(item["next_step"] for item in result["criteria"] if item["key"] == "constraints")
+    assert next(item["next_step"] for item in result["criteria"] if item["key"] == "data") == "No action needed; the conditions are complete."
+    assert result["warnings"] == ["The data arrives after the report deadline."]
+
+
+def test_maximum_input_source_packet_is_bounded_and_keeps_all_tokens():
+    draft = "A. " * 4000
+    answers = {field: "B. " * 1000 for field in list(FIELDS)[1:9]}
+    passages = source_passages({"draft": draft, **{f"answers.{key}": value for key, value in answers.items()}})
+    assert len(draft) == 12000
+    assert sum(map(len, answers.values())) == 24000
+    assert len(passages) <= 64
+    assert sum(item["quote"].count("A.") for item in passages) == 4000
+    assert sum(item["quote"].count("B.") for item in passages) == 8000
+    assert len(json.dumps(passages).encode("utf-8")) < 80000
+
+
+def test_offline_reserves_total_budget_without_truncating_explicit_answers():
+    answers = {field: "Supplied fact. " * 200 for field in list(FIELDS)[2:10]}
+    assert sum(map(len, answers.values())) == 24000
+    result = analyze_brief(DRAFT, answers, "en", offline=True)
+    assert sum(map(len, result["fields"].values())) <= 24000
+    assert all(result["fields"][key] == value.strip() for key, value in answers.items())
+
+
+def test_overlong_explicit_title_fails_before_api():
+    with pytest.raises(ValueError, match="180"):
+        analyze_brief(DRAFT, {"title": "x" * 181}, "en")
+
+
+def test_coverage_does_not_split_negation_from_a_wrapped_line():
+    draft = "We do not\ncollect student names. Teachers review the checklist."
+    passages = source_passages({"draft": draft})
+    assert len(passages) == 2
+    assert passages[0]["quote"] == "We do not\ncollect student names."
+    raw = coverage_result(draft, assignment={"s1": ["constraints"], "s2": ["users"]})
+    result = validate_analysis(raw, draft, {}, "en")
+    assert result["fields"]["constraints"] == "We do not\ncollect student names."
+
+
+def test_duplicate_passage_labels_merge_without_losing_a_fact():
+    raw = coverage_result(DRAFT)
+    raw["coverage"].append({"source_id": "s1", "fields": ["users"]})
+    result = validate_analysis(raw, DRAFT, {}, "en")
+    assert result["fields"]["context"] == result["fields"]["users"] == DRAFT
+
+
+def test_empty_field_positive_level_is_safely_zeroed():
+    raw = valid_result()
+    raw["criteria"][1].pop("evidence")
+    raw["criteria"][1]["level"] = 3
+    result = validate_analysis(raw, DRAFT, {}, "en")
+    assert result["criteria"][1]["points"] == 0
+
+
+def test_complete_criterion_empty_next_step_gets_confirmation_not_failure():
+    raw = valid_result()
+    raw["fields"]["need"] = DRAFT
+    raw["criteria"][0].update(level=4, next_step="")
+    result = validate_analysis(raw, DRAFT, {}, "en")
+    assert "Confirm" in result["criteria"][0]["next_step"]
+
+
+def test_derived_evidence_can_exceed_the_tool_claim_limit():
+    claims = [{"field": "context", "source": "draft", "quote": DRAFT} for _ in range(50)]
+    assert verify_quotes(claims, {"draft": DRAFT})["valid"]
+    assert not verify_quotes(claims, {"draft": DRAFT}, max_claims=40)["valid"]

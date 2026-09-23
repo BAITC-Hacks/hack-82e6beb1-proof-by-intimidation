@@ -8,11 +8,12 @@ import os
 import re
 import secrets
 import sqlite3
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import asynccontextmanager
 from pathlib import Path
+from threading import Lock
 from typing import Any, Literal
 from urllib.parse import urlsplit
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
@@ -23,10 +24,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from server.database import (
-    CARD_FIELDS, ROOT, challenge_view, encode, initialize, now,
+    CARD_FIELDS, ROOT, catalog_view, challenge_view, encode, initialize, now,
     proposal_view, seed_file, transaction,
 )
 from server.limits import AnalysisLimits
+from server.jobs import AnalysisJobs
 from server.messages import analysis_failure, language_from_header, translate, validation_message
 
 load_dotenv()
@@ -85,6 +87,10 @@ class AnalyzeInput(Input):
         return {key: text.strip() for key, text in value.items()}
 
 
+class AnalysisJobInput(AnalyzeInput):
+    request_id: UUID | None = None
+
+
 class ChallengeInput(Input):
     draft: str = Field(min_length=8, max_length=12000)
     fields: dict[str, str]
@@ -123,8 +129,10 @@ class ProposalInput(Input):
         try:
             parsed = urlsplit(value)
             valid = parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+            # urlsplit parses the authority lazily; accessing port validates numeric/range bounds.
+            valid = valid and (parsed.port is None or 1 <= parsed.port <= 65535)
             valid = valid and not parsed.username and not parsed.password
-            valid = valid and not any(character.isspace() for character in value)
+            valid = valid and not any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in value)
         except ValueError:
             valid = False
         if not valid:
@@ -174,7 +182,10 @@ def _confirmed_rating(
 
 
 def _complete_fields(fields: dict[str, str]) -> dict[str, str]:
-    result = {key: fields.get(key, "") for key in CARD_FIELDS}
+    try:
+        result = check_fields({key: fields.get(key, "") for key in CARD_FIELDS})
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
     if len(result["title"].strip()) < 3:
         raise HTTPException(422, "Give your task a title of at least three characters before publishing.")
     if not result["context"] and not result["need"]:
@@ -187,12 +198,28 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
-        initialize(path, score_card_fields)
-        yield
+        with application.state.lifecycle_lock:
+            if application.state.lifecycle_users == 0:
+                initialize(path, score_card_fields)
+                application.state.analysis_jobs = AnalysisJobs(
+                    path, lambda *args, **kwargs: analyze_brief(*args, **kwargs),
+                    lambda: application.state.analysis_limits,
+                )
+                application.state.analysis_jobs.start()
+            application.state.lifecycle_users += 1
+        try:
+            yield
+        finally:
+            with application.state.lifecycle_lock:
+                application.state.lifecycle_users -= 1
+                if application.state.lifecycle_users == 0:
+                    application.state.analysis_jobs.stop()
 
     application = FastAPI(title="AI Sana Challenge Hub", version="2.0.0", lifespan=lifespan)
     application.state.database_path = path
     application.state.analysis_limits = AnalysisLimits()
+    application.state.lifecycle_lock = Lock()
+    application.state.lifecycle_users = 0
     application.add_middleware(
         CORSMiddleware, allow_origins=sorted(DEV_ORIGINS), allow_credentials=True,
         allow_methods=["GET", "POST", "PATCH"], allow_headers=["Content-Type", "Accept-Language"],
@@ -255,16 +282,16 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
     @application.get("/api/bootstrap")
     def bootstrap(request: Request):
         with transaction(path) as db:
-            challenges = [challenge_view(db, row, request.state.actor) for row in db.execute(
-                "SELECT * FROM challenges ORDER BY score DESC, created_at DESC, id"
-            ).fetchall()]
+            challenges = catalog_view(db, request.state.actor)
             teams = [dict(row) for row in db.execute("SELECT * FROM teams ORDER BY id")]
             cards = {task["id"]: task for task in seed_file("tasks.json")}
             drafts = [{
                 "id": item["id"], "text": item["text"], "topic": item["topic"],
                 "answers": {key: cards[item["demo_card_id"]].get(key, "") for key in CARD_FIELDS},
             } for item in seed_file("drafts.json")]
-            proposals = [p for task in challenges for p in task["proposals"]]
+            proposal_stats = db.execute("""SELECT count(*) AS total,
+                coalesce(sum(status='accepted'),0) AS accepted,
+                coalesce(sum(points=10),0) AS completed FROM proposals""").fetchone()
             return {
                 "challenges": challenges, "teams": teams, "drafts": drafts,
                 "ai": {
@@ -272,11 +299,11 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
                     "model": os.getenv("OPENAI_MODEL", ""),
                 },
                 "stats": {
-                    "challenges": len(challenges), "teams": len(teams), "proposals": len(proposals),
+                    "challenges": len(challenges), "teams": len(teams), "proposals": proposal_stats["total"],
                     "ready": sum(task["score"] >= 70 for task in challenges),
                     "my_challenges": sum(task["is_owner"] for task in challenges),
-                    "accepted": sum(p["status"] == "accepted" for p in proposals),
-                    "completed": sum(bool(p["milestone"]) for p in proposals),
+                    "accepted": proposal_stats["accepted"],
+                    "completed": proposal_stats["completed"],
                 },
             }
 
@@ -284,12 +311,17 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
     def analyze(payload: AnalyzeInput, request: Request):
         from agent.architect import AnalysisUnavailable
         try:
-            with nullcontext() if payload.offline else application.state.analysis_limits.slot(request.state.actor):
+            with application.state.analysis_jobs.synchronous_slot(request.state.actor, payload.offline):
                 result = analyze_brief(payload.draft, payload.answers, payload.language, offline=payload.offline)
         except AnalysisUnavailable as error:
-            raise HTTPException(503, analysis_failure(str(error), request.state.language)) from error
+            raise HTTPException(503, analysis_failure(str(error), request.state.language, error.code)) from error
         except ValueError as error:
-            raise HTTPException(422, str(error)) from error
+            raise HTTPException(422, "Please check the highlighted information and try again.") from error
+        except HTTPException:
+            raise
+        except Exception:
+            # Do not surface or log unexpected provider response bodies or user text.
+            raise HTTPException(503, analysis_failure("", request.state.language)) from None
         identifier = str(uuid4())
         result = {**result, "analysis_id": identifier}
         with transaction(path) as db:
@@ -297,6 +329,17 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
                 identifier, request.state.actor, encode(result), now(),
             ))
         return result
+
+    @application.post("/api/analysis-jobs", status_code=202)
+    def create_analysis_job(payload: AnalysisJobInput, request: Request):
+        return application.state.analysis_jobs.submit(
+            request.state.actor, payload.model_dump(exclude={"request_id"}),
+            str(payload.request_id) if payload.request_id else None, request.state.language,
+        )
+
+    @application.get("/api/analysis-jobs/{job_id}")
+    def get_analysis_job(job_id: UUID, request: Request):
+        return application.state.analysis_jobs.get(str(job_id), request.state.actor, request.state.language)
 
     @application.post("/api/challenges", status_code=201)
     def publish(payload: ChallengeInput, request: Request):

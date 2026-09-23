@@ -644,3 +644,18 @@ select { padding-right: 28px; cursor: pointer; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }
+.job-notice { margin-bottom: 20px; }
+.job-notice p { margin: 5px 0 0; line-height: 1.6; }
+.job-notice small { display: block; margin-top: 8px; overflow-wrap: anywhere; }
+.catalog-job { margin-bottom: 25px; }
+.catalog-job .job-notice { margin-bottom: 10px; }
+.form-save-note { display: flex; align-items: flex-start; gap: 7px; color: var(--muted, #617086); font-size: 12px; line-height: 1.6; margin: 0 0 18px; }
+.form-save-note .icon { flex-shrink: 0; margin-top: 2px; }
+.storage-error { color: #a12626; }
+.form-fields { border: 0; padding: 0; margin: 0; min-width: 0; }
+.rating-guidance { font-size: 12px; line-height: 1.6; border-top: 1px solid var(--line, #e8ecf2); padding-top: 15px; margin-top: 15px; }
+.rating-guidance > p { margin: 0 0 10px; }
+.rating-guidance ul { margin: 7px 0 0; padding-left: 17px; }
+.rating-guidance li + li { margin-top: 10px; }
+.rating-guidance li > span { font-weight: 650; }
+.rating-guidance li > p { margin: 3px 0 0; color: var(--muted, #617086); }

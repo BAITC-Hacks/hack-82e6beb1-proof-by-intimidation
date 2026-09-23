@@ -5,6 +5,9 @@ from __future__ import annotations
 from typing import Any
 
 MESSAGES = {
+    "The server restarted before analysis finished. Your draft is safe; retry the analysis.": ("Сервер перезапущен до завершения анализа. Черновик сохранён — запустите анализ ещё раз.", "Талдау аяқталмай сервер қайта іске қосылды. Бастапқы мәтін сақталды — талдауды қайта бастаңыз."),
+    "This analysis request was already used for a different draft. Start a new analysis.": ("Этот запрос уже относится к другому черновику. Запустите новый анализ.", "Бұл сұрау басқа бастапқы мәтінге тиесілі. Жаңа талдауды бастаңыз."),
+    "This analysis job is not available in this browser.": ("Этот анализ недоступен в данном браузере.", "Бұл талдау осы браузерде қолжетімсіз."),
     "This task could not be found.": ("Задача не найдена.", "Тапсырма табылмады."),
     "Only the task's creator can make this change from their original browser.": ("Это действие доступно только автору задачи в том браузере, где она была создана.", "Бұл әрекетті тек тапсырма авторы оны жасаған браузерде орындай алады."),
     "The analysis is not available in this workspace. Analyze the draft again.": ("Этот анализ недоступен в вашем рабочем пространстве. Проанализируйте черновик ещё раз.", "Бұл талдау жұмыс кеңістігіңізде қолжетімсіз. Бастапқы мәтінді қайта талдаңыз."),
@@ -69,10 +72,10 @@ def translate(message: str, language: str = "ru") -> str:
     return MESSAGES[message][1 if language == "kk" else 0]
 
 
-def analysis_failure(message: str, language: str) -> str:
-    if any(fragment in message for fragment in ("not connected", "не подключён", "қосылмаған")):
+def analysis_failure(message: str, language: str, code: str | None = None) -> str:
+    if code == "not_configured" or any(fragment in message for fragment in ("not connected", "не подключён", "қосылмаған")):
         key = "AI is not connected. Configure the server or choose the labelled offline check."
-    elif any(fragment in message for fragment in ("fact validation", "проверку фактов", "деректерді тексеруден")):
+    elif code == "validation_failed" or any(fragment in message for fragment in ("fact validation", "проверку фактов", "деректерді тексеруден")):
         key = "The AI answer failed fact validation. Your text is preserved; retry or choose the labelled offline check."
     else:
         key = "AI is unavailable. Your text is preserved; retry later or choose the labelled offline check."

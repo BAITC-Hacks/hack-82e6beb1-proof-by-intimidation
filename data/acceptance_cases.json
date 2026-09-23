@@ -1,0 +1,77 @@
+[
+  {
+    "id": "repair_workshop_ru",
+    "language": "ru",
+    "topic": "Работа колледжа",
+    "draft": "В колледже заявки на ремонт проекторов приходят технику в мессенджер. Техник переписывает их в электронную таблицу, но иногда забывает сообщить преподавателю, что ремонт завершён. Хотим проверить простой порядок учёта заявок, без покупки нового оборудования.",
+    "initial_field_terms": {"users": ["техник", "преподавател"], "constraints": ["без покупки нового оборудования"]},
+    "answers": {
+      "title": "Учёт заявок на ремонт проекторов",
+      "context": "Заявки преподавателей на ремонт проекторов поступают технику в мессенджер и вручную переносятся в таблицу. Преподаватели не всегда узнают о завершении ремонта.",
+      "need": "Сделать состояние каждой заявки понятным технику и преподавателю, не заменяя проекторы.",
+      "users": "Техник колледжа регистрирует и закрывает заявки; преподаватель проверяет состояние своей заявки.",
+      "data": "Техник передаст по электронной почте синтетический CSV из 24 заявок с кодом аудитории, датой, неисправностью и состоянием. Реальных имён и переписки нет.",
+      "constraints": "Две недели. Без покупки оборудования, интеграции с мессенджером и персональных данных. Для демонстрации используется только синтетический CSV.",
+      "expected_result": "Локальный веб-прототип списка заявок с изменением состояния и выгрузкой CSV; краткая инструкция для техника.",
+      "success_criteria": "Техник проходит путь от новой заявки до закрытия на четырёх контрольных записях; преподаватель по коду аудитории видит правильное состояние без звонка технику.",
+      "contact": "repair-mentor@example.org",
+      "interaction_format": "Техник отвечает по электронной почте в рабочие дни и участвует в двух согласованных проверках прототипа."
+    },
+    "field_terms": {
+      "constraints": ["Без покупки оборудования", "персональных данных"],
+      "success_criteria": ["четырёх", "без звонка"],
+      "users": ["Техник", "преподаватель"]
+    },
+    "review_checks": ["Не предлагать закупку проекторов или обязательную интеграцию с мессенджером.", "Уточнить передачу CSV и проверку состояний, а не повторно спрашивать о названных пользователях.", "Качественная проверка состояния заявки является наблюдаемым критерием успеха."]
+  },
+  {
+    "id": "feedback_workflow_kk",
+    "language": "kk",
+    "topic": "Білім беру",
+    "draft": "Қазақ тілі мұғалімі эсселердегі қайталанатын қателерді қолмен жинақтайды. Мұғалімге келесі сабақта нені түсіндіру керегін анықтау қиын. Автоматты баға қоюға болмайды; оқушылардың аты-жөні жиналмайды.",
+    "initial_field_terms": {"users": ["мұғалім"], "constraints": ["Автоматты баға қоюға болмайды", "аты-жөні жиналмайды"]},
+    "answers": {
+      "title": "Эсседегі қайталанатын қателерді жинақтау",
+      "context": "Қазақ тілі мұғалімі эсселердегі қателерді жеке жазбаларда сақтайды және сынып бойынша ортақ қиындықтарды қолмен іздейді.",
+      "need": "Келесі сабаққа ортақ түсіндіруді жоспарлау үшін қателерді мұғалім бекіткен санаттарға жинақтау.",
+      "users": "Қазақ тілі мұғалімі қате мысалдарын тексеріп, келесі сабақтың тақырыбын таңдайды.",
+      "data": "Мұғалім электрондық пошта арқылы 15 жасанды эссе және бес қате санатының сипаттамасын береді. Нақты оқушы жұмыстары қолданылмайды.",
+      "constraints": "Бір апта. Автоматты баға қоюға болмайды; оқушылардың аты-жөні жиналмайды. Тек мұғалім бекіткен санаттар қолданылады.",
+      "expected_result": "Қате санаттары, жиілігі және жасанды эсседен мысалы бар кесте; мұғалімге арналған қысқа қолдану нұсқаулығы.",
+      "success_criteria": "Мұғалім әр мысалды бастапқы жасанды эссемен салыстырады, қате санатын растайды және кесте арқылы келесі сабақта түсіндіретін тақырыпты таңдай алады.",
+      "contact": "teacher-mentor@example.org",
+      "interaction_format": "Бір бастапқы онлайн кездесу және бір қорытынды тексеру; аралық сұрақтар электрондық пошта арқылы жіберіледі."
+    },
+    "field_terms": {
+      "users": ["мұғалімі"],
+      "constraints": ["Автоматты баға қоюға болмайды", "аты-жөні жиналмайды"],
+      "success_criteria": ["бастапқы жасанды эссемен салыстырады"]
+    },
+    "review_checks": ["Мұғалім пайдаланушы ретінде сақталуы керек.", "Автоматты бағалау мен оқушының жеке деректерін жинауды ұсынбау.", "Кесте жеткілікті; жаңа қолданбаны немесе ML-модельді міндетті деп санауға болмайды."]
+  },
+  {
+    "id": "archive_handover_en",
+    "language": "en",
+    "topic": "Education and heritage",
+    "draft": "Our community archive trains student volunteers to describe donated photographs. Volunteers use a shared spreadsheet, but place names are entered inconsistently. We need a two-week review of the existing naming guide, not a new catalog application. Only fictional photograph descriptions may be used during the student project.",
+    "initial_field_terms": {"data": ["naming guide"], "constraints": ["not a new catalog application", "fictional"]},
+    "answers": {
+      "title": "A consistent place-name guide for archive volunteers",
+      "context": "Student volunteers describe donated photographs in a shared spreadsheet and enter different spellings for the same place.",
+      "need": "Make the existing place-name guide clear enough for volunteers to apply consistently.",
+      "users": "New student volunteers use the guide when entering a photograph description; the archive coordinator reviews their entries.",
+      "data": "The coordinator will email the current naming guide and 20 fictional spreadsheet rows with deliberately inconsistent place names. No donor information or original photographs are shared.",
+      "constraints": "Two weeks. Revise the guide only, not a new catalog application. Use fictional records and do not change the archive's historical naming policy.",
+      "expected_result": "An edited naming guide PDF, a corrected fictional CSV and a short explanation of ambiguous rules.",
+      "success_criteria": "The coordinator uses the revised guide on every fictional row and can decide the permitted place name without asking the student team for clarification. Unresolved policy choices are explicitly listed, not guessed.",
+      "contact": "archive-mentor@example.org",
+      "interaction_format": "The coordinator answers email within two working days and attends a kickoff meeting and a final review."
+    },
+    "field_terms": {
+      "data": ["current naming guide", "fictional"],
+      "constraints": ["not a new catalog application", "historical naming policy"],
+      "success_criteria": ["without asking", "not guessed"]
+    },
+    "review_checks": ["Preserve the existing guide as an available artifact even before the clarification answers.", "Do not assume the deliverable is software or requires machine learning.", "Observable qualitative acceptance is valid without invented numeric targets."]
+  }
+]

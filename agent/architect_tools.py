@@ -9,6 +9,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from agent.evidence import original_quote
+
 FIELDS = (
     "title", "context", "need", "users", "data", "constraints",
     "expected_result", "success_criteria", "contact", "interaction_format",
@@ -49,24 +51,20 @@ def get_rubric(language: str = "ru") -> dict[str, Any]:
     }
 
 
-def verify_quotes(claims: list[dict[str, str]], sources: dict[str, str]) -> dict[str, Any]:
+def verify_quotes(claims: list[dict[str, str]], sources: dict[str, str], max_claims: int = 2048) -> dict[str, Any]:
     """Source text comes from the server, never from model-supplied tool arguments."""
-    if not isinstance(claims, list) or len(claims) > 40 or any(not isinstance(item, dict) for item in claims):
+    if not isinstance(claims, list) or len(claims) > max_claims or any(not isinstance(item, dict) for item in claims):
         return {"valid": False, "checks": []}
     checks = []
-    for claim in claims[:40]:
+    for claim in claims:
         source, quote = claim.get("source", ""), claim.get("quote", "")
         field = claim.get("field", "")
-        allowed = source == "draft" or source == f"answers.{field}"
+        allowed = isinstance(source, str) and (source == "draft" or (source.startswith("answers.") and source[8:] in FIELDS))
         if quote == "" and allowed and field in FIELDS:
             continue  # An empty field makes no factual claim to verify.
-        if isinstance(quote, str) and quote not in sources.get(source, ""):
-            for opening, closing in (("\"", "\""), ("«", "»"), ("“", "”"), ("'", "'")):
-                if quote.startswith(opening) and quote.endswith(closing):
-                    quote = quote[1:-1]
-                    break
-        valid = bool(allowed and field in FIELDS and quote and quote in sources.get(source, ""))
-        checks.append({"field": field, "source": source, "quote": quote, "valid": valid})
+        matched = original_quote(quote, sources.get(source, "")) if allowed and isinstance(quote, str) else None
+        valid = bool(allowed and field in FIELDS and matched)
+        checks.append({"field": field, "source": source, "quote": matched or quote, "valid": valid})
     return {"valid": all(item["valid"] for item in checks), "checks": checks}
 
 
@@ -138,7 +136,7 @@ REVIEW_SCHEMA = object_schema({"key": {"type": "string", "enum": list(RUBRIC)}, 
 EVIDENCE_SCHEMA = object_schema({"field": {"type": "string", "enum": list(FIELDS)}, "quote": STRING, "source": STRING})
 TOOL_SCHEMAS = [
     {"type": "function", "name": "get_readiness_rubric", "description": "Get the authoritative seven criteria, weights and semantic levels before assessing this brief.", "strict": True, "parameters": object_schema({})},
-    {"type": "function", "name": "verify_user_evidence", "description": "Verify exact quotes in the actual user draft or the corresponding answer. Source must be draft or answers.FIELD; never supply source contents.", "strict": True, "parameters": object_schema({"claims": {"type": "array", "items": EVIDENCE_SCHEMA}})},
+    {"type": "function", "name": "verify_user_evidence", "description": "Verify original passages in the user draft or any supplied answer. Whitespace may vary; words must not. Source must be draft or answers.FIELD. Verify separate passages separately; never supply source contents.", "strict": True, "parameters": object_schema({"claims": {"type": "array", "items": EVIDENCE_SCHEMA}})},
     {"type": "function", "name": "calculate_readiness", "description": "Calculate preview points using proposed semantic levels and source-grounded fields. This does not confirm or publish the card.", "strict": True, "parameters": object_schema({"fields": FIELD_SCHEMA, "criteria": {"type": "array", "items": REVIEW_SCHEMA}})},
     {"type": "function", "name": "compare_revision", "description": "Compare fields extracted from the original draft with the updated fields after answers. Both versions must contain only exact source excerpts. Useful after clarification.", "strict": True, "parameters": object_schema({"previous_fields": FIELD_SCHEMA, "fields": FIELD_SCHEMA})},
 ]

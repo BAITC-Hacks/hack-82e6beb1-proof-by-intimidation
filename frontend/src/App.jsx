@@ -1,7 +1,42 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { api, safeLink } from './api.js';
 import { criterionLabels, fieldLabels, fieldsOrder, levelKey, translator } from './i18n.js';
-import { analysisSuccessPatch, answersForAnalysis, draftHasEdits, fieldsDiffer, replaceDraftText, restoreDraft } from './editor-state.js';
+import { answersForAnalysis, completedDraftPatch, draftHasEdits, draftSnapshot, fieldMaxLength, fieldsDiffer, replaceDraftText, restoreDraft, titleTooLong } from './editor-state.js';
+import { analysisBusyKey, analysisJobs, inputSnapshot, jobIsPending } from './analysis-jobs.js';
+import { clearSaved, readSaved, saveLocal, storageIsUnsaved } from './persistence.js';
+
+function useSavedForm(key, fallback, normalize = value => value) {
+  const [value, update] = useState(() => normalize(readSaved(key, fallback)));
+  const latest = useRef(value);
+  const [storageFailed, setStorageFailed] = useState(() => storageIsUnsaved(key));
+  const setValue = next => {
+    const result = typeof next === 'function' ? next(latest.current) : next;
+    latest.current = result;
+    setStorageFailed(!saveLocal(key, normalize(result)));
+    update(result);
+  };
+  return [value, setValue, storageFailed];
+}
+function useJob(channel) {
+  return useSyncExternalStore(analysisJobs.subscribe, () => analysisJobs.get(channel));
+}
+function useLeaveWarning(active, message) {
+  useEffect(() => {
+    if (!active) return;
+    const beforeUnload = event => { event.preventDefault(); event.returnValue = ''; };
+    const navigate = event => { if (!window.confirm(message)) event.preventDefault(); };
+    window.addEventListener('beforeunload', beforeUnload);
+    window.addEventListener('sana-before-navigate', navigate);
+    return () => { window.removeEventListener('beforeunload', beforeUnload); window.removeEventListener('sana-before-navigate', navigate); };
+  }, [active, message]);
+}
+const allowNavigation = () => window.dispatchEvent(new Event('sana-before-navigate', { cancelable: true }));
+
+function JobNotice({ job, t }) {
+  useLeaveWarning(Boolean(job?.storageFailed), t('storageWarning'));
+  if (!jobIsPending(job)) return job?.storageFailed ? <div className="notice error" role="alert"><Icon name="alert" size={18}/><p>{t('storageWarning')}</p></div> : null;
+  return <div className={`notice ${job.connectionError ? 'warning' : 'info'} compact job-notice`} role="status"><Icon name={job.connectionError ? 'refresh' : 'clock'} size={18}/><div><strong>{t(job.connectionError ? 'jobReconnecting' : job.recovered ? 'jobRecovered' : 'jobRunning')}</strong><p>{t(job.storageFailed ? 'storageWarning' : 'jobNavigationSafe')}</p>{job.connectionError && <small>{job.connectionError}</small>}</div></div>;
+}
 
 const icons = {
   grid: <><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></>,
@@ -46,9 +81,12 @@ function routeUrl(view, values = {}) {
 }
 function useRoute() {
   const [route, setRoute] = useState(readRoute);
-  useEffect(() => { const onPop = () => setRoute(readRoute()); window.addEventListener('popstate', onPop); return () => window.removeEventListener('popstate', onPop); }, []);
+  const lastUrl = useRef(window.location.href);
+  useEffect(() => { const onPop = () => { if (allowNavigation()) { lastUrl.current = window.location.href; setRoute(readRoute()); } else window.history.pushState({}, '', lastUrl.current); }; window.addEventListener('popstate', onPop); return () => window.removeEventListener('popstate', onPop); }, []);
   const navigate = useCallback((view, values = {}, replace = false) => {
+    if (!replace && !allowNavigation()) return;
     window.history[replace ? 'replaceState' : 'pushState']({}, '', routeUrl(view, values));
+    lastUrl.current = window.location.href;
     setRoute(readRoute());
     if (!replace) window.scrollTo({ top: 0, behavior: 'instant' });
   }, []);
@@ -91,12 +129,15 @@ function RatingPanel({ analysis, initialScore, t, language, preview = false, com
   const score = Number(analysis?.score ?? 0);
   const list = criteriaList(analysis?.criteria);
   const level = levelKey(score);
+  const gaps = [...list].filter(item => Number(item.points ?? item.score ?? 0) < Number(item.weight || item.max_points || 0) && item.next_step).sort((a,b) => (Number(b.weight || 0)-Number(b.points || 0))-(Number(a.weight || 0)-Number(a.points || 0))).slice(0,2);
+  const supported = list.filter(item => Number(item.points ?? item.score ?? 0) > 0 && textValue(item.evidence));
   return <section className={`rating-panel ${compact ? 'compact' : ''}`} aria-label={t('rating')}>
     <div className="rating-heading"><h2>{t(preview ? 'previewScore' : 'readiness')}</h2><Icon name="chart" size={19}/></div>
     <div className="rating-total"><span className={`rating-number ${level}`}>{score}<small>/100</small></span><div><Badge score={score} t={t}/><p>{t(`${level}Hint`)}</p></div></div>
     <div className="rating-scale" aria-hidden="true"><span style={{ width: `${score}%` }} className={level}/></div>
     {initialScore !== undefined && score !== initialScore && <div className="score-change"><span>{t('originalScore')} <b>{initialScore}</b></span><Icon name="arrow" size={16}/><span>{t('nowScore')} <b>{score}</b></span><strong className={score < initialScore ? 'decreased' : ''}>{score > initialScore ? '+' : ''}{score - initialScore} {t('points',Math.abs(score-initialScore))}</strong></div>}
     <p className="rating-caption">{t(preview ? 'scoreHint' : 'scoreMeaning')}</p>
+    {preview && list.length > 0 && <div className="rating-guidance"><p><strong>{t('supportedFacts')}</strong> {supported.length} / {list.length}</p>{gaps.length > 0 && <><strong>{t('priorityGaps')}</strong><ul>{gaps.map(item => <li key={item.key}><span>{criterionLabels[language][item.key] || item.label}</span><p>{item.next_step}</p></li>)}</ul></>}</div>}
     {analysis?.score_source && analysis.score_source !== 'ai' && <p className="rating-source"><Icon name="info" size={13}/>{t(analysis.analysis_fields_changed ? 'editedRating' : analysis.score_source === 'sample' ? 'sampleRating' : 'localRating')}</p>}
     {list.length > 0 && <div className="criteria-list">{list.map((criterion, index) => {
       const weight = Number(criterion.weight || criterion.max_points || 0);
@@ -112,6 +153,7 @@ function RatingPanel({ analysis, initialScore, t, language, preview = false, com
 }
 
 function Catalog({ data, route, navigate, t }) {
+  const editorJob = useJob('editor');
   const [query, setQuery] = useState(route.q);
   useEffect(() => setQuery(route.q), [route.q]);
   const all = data.challenges || [];
@@ -123,6 +165,7 @@ function Catalog({ data, route, navigate, t }) {
   const updateFilter = (key, value) => navigate('catalog', { q: query, topic: route.topic, level: route.level, [key]: value }, true);
   const activeFilters = query || route.topic || route.level;
   return <>
+    {editorJob && <div className="catalog-job"><JobNotice job={editorJob} t={t}/><NavLink view="editor" navigate={navigate} className="text-button">{t(editorJob.status === 'succeeded' ? 'openReview' : 'returnDraft')}<Icon name="arrow" size={16}/></NavLink></div>}
     <div className="page-heading catalog-heading"><div><h1>{t('catalogTitle')}</h1><p>{t('catalogIntro')}</p></div><NavLink view="editor" navigate={navigate} className="button primary"><Icon name="plus" size={18}/>{t('newTask')}</NavLink></div>
     <div className="catalog-bar"><div className="catalog-tab">{t('allTasks')}<span>{all.length}</span></div><span className="catalog-sort"><Icon name="chart" size={16}/>{t('sort')}</span></div>
     <div className="filters"><div className="search-field"><Icon name="search" size={19}/><input aria-label={t('search')} type="search" name="search" autoComplete="off" placeholder={t('searchPlaceholder')} value={query} onChange={e => { setQuery(e.target.value); updateFilter('q', e.target.value); }}/></div><select aria-label={t('topic')} value={route.topic} onChange={e => updateFilter('topic', e.target.value)}><option value="">{t('allTopics')}</option>{topics.map(topic => <option key={topic}>{topic}</option>)}</select><select aria-label={t('readiness')} value={route.level} onChange={e => updateFilter('level', e.target.value)}><option value="">{t('allLevels')}</option>{['priority','ready','working','draft'].map(level => <option key={level} value={level}>{t(level)}</option>)}</select></div>
@@ -145,84 +188,102 @@ function ChallengeCard({ task, navigate, t, featured }) {
 function TaskDetail({ id, data, navigate, t, language, onUpdate, notify }) {
   const [task, setTask] = useState(() => data.challenges.find(item => item.id === id));
   const [error, setError] = useState('');
-  const [tab, setTab] = useState('brief');
-  useEffect(() => { let current = true; setError(''); api(`/challenges/${encodeURIComponent(id)}`).then(value => { if (current) setTask(value.challenge || value); }).catch(err => current && setError(err.message)); return () => { current = false; }; }, [id]);
-  if (!task && error) return <ErrorBox title={t('loadError')} error={error}/>;
-  if (!task) return <Loading t={t}/>;
+  const [tab, updateTab] = useState('brief');
+  const setTab = next => { if (allowNavigation()) updateTab(next); };
+  const [reload, setReload] = useState(0);
+  useEffect(() => { let current = true; setError(''); api(`/challenges/${encodeURIComponent(id)}`).then(value => { if (current) setTask(value.challenge || value); }).catch(err => current && setError(err.message)); return () => { current = false; }; }, [id,reload]);
+  const retry = <button className="button secondary small" onClick={() => setReload(value => value+1)}>{t('retry')}</button>;
+  if ((!task || task.summary) && error) return <ErrorBox title={t('loadError')} error={error}>{retry}</ErrorBox>;
+  if (!task || task.summary) return <Loading t={t}/>;
   const fields = task.fields || task;
   return <>
     <NavLink view="catalog" navigate={navigate} className="back-link"><Icon name="back" size={17}/>{t('backCatalog')}</NavLink>
+    <ErrorBox title={t('refreshFailed')} error={error}>{retry}</ErrorBox>
     <div className="detail-heading"><div className="inline-meta"><span className="topic-label">{task.topic}</span><span className="seed-label">{provenance(task,t)}</span></div><h1>{task.title || fields.title}</h1><div className="detail-heading-bottom"><Badge score={task.score} t={t}/><span><Icon name="users" size={17}/>{task.proposal_count ?? task.proposals?.length ?? 0} {t('proposals',task.proposal_count ?? task.proposals?.length ?? 0)}</span>{task.is_owner && <NavLink view="workspace" values={{id:task.id}} navigate={navigate} className="text-button">{t('viewWorkspace')}<Icon name="arrow" size={16}/></NavLink>}</div></div>
     <div className="detail-layout"><div><div className="section-tabs"><button className={tab === 'brief' ? 'active' : ''} onClick={() => setTab('brief')}>{t('taskDetails')}</button><button className={tab === 'apply' ? 'active' : ''} onClick={() => setTab('apply')}>{t('application')}<Icon name="arrow" size={15}/></button></div>
-      {tab === 'brief' ? <article className="brief-document">{fieldsOrder.filter(key => key !== 'title').map(key => <section key={key} className={!fields[key] ? 'missing-field' : ''}><h2>{fieldLabels[language][key]}</h2><p>{textValue(fields[key]) || t('notProvided')}</p></section>)}<div className="document-action"><button className="button primary" onClick={() => setTab('apply')}>{t('application')}<Icon name="arrow" size={17}/></button><p>{t('noRestrictions')}</p></div></article> : <ProposalForm task={task} teams={data.teams} t={t} onSent={() => { onUpdate(); api(`/challenges/${encodeURIComponent(id)}`).then(value => setTask(value.challenge || value)); notify(t('proposalSent')); }}/>}</div>
+      {tab === 'brief' ? <article className="brief-document">{fieldsOrder.filter(key => key !== 'title').map(key => <section key={key} className={!fields[key] ? 'missing-field' : ''}><h2>{fieldLabels[language][key]}</h2><p>{textValue(fields[key]) || t('notProvided')}</p></section>)}<div className="document-action"><button className="button primary" onClick={() => setTab('apply')}>{t('application')}<Icon name="arrow" size={17}/></button><p>{t('noRestrictions')}</p></div></article> : <ProposalForm task={task} teams={data.teams} t={t} onSent={() => { onUpdate(); setReload(value => value+1); notify(t('proposalSent')); }}/>}</div>
       <aside className="detail-aside"><RatingPanel analysis={task} t={t} language={language}/><div className="aside-note"><Icon name="shield" size={19}/><p>{t('noRestrictions')}</p></div></aside>
     </div>
   </>;
 }
 
 function ProposalForm({ task, teams = [], t, onSent }) {
-  const [form, setForm] = useState({ team_id: teams[0]?.id || 'custom', team_name: '', skills: '', idea: '', plan: '', deadline: '', link: '' });
+  const formKey = `sana-proposal-${task.id}`;
+  const [form, setForm, storageFailed] = useSavedForm(formKey, { team_id: 'custom', team_name: '', skills: '', idea: '', plan: '', deadline: '', link: '' });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [sent, setSent] = useState(false);
+  useLeaveWarning(busy || storageFailed, t(busy ? 'writePendingWarning' : 'storageWarning'));
   const selected = teams.find(team => team.id === form.team_id);
   const update = (key, value) => setForm(old => ({ ...old, [key]: value }));
   const submit = async event => {
     event.preventDefault(); setBusy(true); setError('');
-    try { const body = {idea:form.idea,plan:form.plan,deadline:form.deadline,link:form.link,...(form.team_id === 'custom' ? {team_name:form.team_name,skills:form.skills} : {team_id:form.team_id})}; await api(`/challenges/${encodeURIComponent(task.id)}/proposals`, { method: 'POST', body }); setSent(true); onSent(); }
+    try { const body = {idea:form.idea,plan:form.plan,deadline:form.deadline,link:form.link,...(form.team_id === 'custom' ? {team_name:form.team_name,skills:form.skills} : {team_id:form.team_id})}; await api(`/challenges/${encodeURIComponent(task.id)}/proposals`, { method: 'POST', body }); clearSaved(formKey); setSent(true); onSent(); }
     catch (err) { setError(err.message); }
     finally { setBusy(false); }
   };
   const fillDemo = () => setForm(old => ({...old, idea: t('idea') === 'Solution idea' ? `We will build a small working prototype for “${task.title}” and test it with the users described in the brief.` : t('idea') === 'Шешім идеясы' ? `«${task.title}» тапсырмасына шағын жұмыс прототипін жасап, сипаттамадағы пайдаланушылармен тексереміз.` : `Сделаем небольшой работающий прототип для задачи «${task.title}» и проверим его с пользователями из карточки.`, plan: t('plan') === 'Work plan' ? '1. Confirm available data and constraints with the business.\n2. Build and demonstrate one complete user scenario.\n3. Test against the stated success criteria and document results.' : t('plan') === 'Жұмыс жоспары' ? '1. Қолда бар деректер мен шектеулерді бизнеспен нақтылау.\n2. Бір толық сценарийдің прототипін көрсету.\n3. Табыс өлшемдері бойынша тексеріп, нәтижені тіркеу.' : '1. Уточнить с бизнесом доступные данные и ограничения.\n2. Собрать и показать один полный пользовательский сценарий.\n3. Проверить критерии успеха и зафиксировать результаты.', deadline: t('deadline') === 'Timeline' ? '2 weeks, weekly check-in' : t('deadline') === 'Мерзім' ? '2 апта, апта сайынғы кездесу' : '2 недели, еженедельная встреча', link:'https://example.com/prototype' }));
+  const fillDemoClick = () => { if (form.team_id === 'custom' && !form.team_name && teams[0]) update('team_id',teams[0].id); fillDemo(); };
   if (sent) return <div className="proposal-success"><span className="success-symbol"><Icon name="check" size={30}/></span><h2>{t('proposalSent')}</h2><p>{t('proposalSentText')}</p><button className="button secondary" onClick={() => { setSent(false); setForm(old => ({...old, idea:'',plan:'',deadline:'',link:''})); }}>{t('sendAnother')}</button></div>;
-  return <form className="proposal-form" onSubmit={submit}><h2>{t('application')}</h2><p className="form-intro">{t('noRestrictions')}</p>
+  return <form className="proposal-form" onSubmit={submit}><h2>{t('application')}</h2><p className="form-intro">{t('noRestrictions')}</p><p className={`form-save-note ${storageFailed ? 'storage-error' : ''}`} role="status"><Icon name={storageFailed ? 'alert' : 'check'} size={14}/>{t(storageFailed ? 'storageWarning' : 'formSaved')}</p><fieldset disabled={busy} className="form-fields">
     <Field label={t('team')} name="proposal-team" required><select id="proposal-team" name="team_id" value={form.team_id} onChange={e => update('team_id', e.target.value)} required><option value="" disabled>{t('chooseTeam')}</option><option value="custom">{t('customTeam')}</option>{teams.map(team => <option key={team.id} value={team.id}>{team.name} · {t('seed')}</option>)}</select></Field>
     {form.team_id === 'custom' && <><Field label={t('teamName')} name="proposal-team-name" required><input id="proposal-team-name" name="team_name" minLength="2" maxLength="120" value={form.team_name} onChange={e => update('team_name',e.target.value)} placeholder={t('teamNameHint')} required/></Field><Field label={t('teamSkills')} name="proposal-skills"><input id="proposal-skills" name="skills" maxLength="1000" value={form.skills} onChange={e => update('skills',e.target.value)} placeholder={t('teamSkillsHint')}/></Field></>}
     {selected && <div className="selected-team"><span className="team-avatar">{selected.name?.slice(0,2)}</span><div><strong>{selected.name}</strong><p>{textValue(selected.skills)}</p></div></div>}
-    <div className="demo-fill"><button type="button" className="text-button" onClick={fillDemo}><Icon name="brief" size={16}/>{t('proposalExample')}</button><small>{t('seed')}</small></div>
+    <div className="demo-fill"><button type="button" className="text-button" onClick={fillDemoClick}><Icon name="brief" size={16}/>{t('proposalExample')}</button><small>{t('seed')}</small></div>
     <Field label={t('idea')} name="proposal-idea" required><textarea id="proposal-idea" name="idea" rows="4" minLength="20" maxLength="5000" value={form.idea} onChange={e => update('idea',e.target.value)} placeholder={t('ideaHint')} required/></Field>
     <Field label={t('plan')} name="proposal-plan" required><textarea id="proposal-plan" name="plan" rows="4" minLength="20" maxLength="5000" value={form.plan} onChange={e => update('plan',e.target.value)} placeholder={t('planHint')} required/></Field>
     <div className="form-two-col"><Field label={t('deadline')} name="proposal-deadline" required><input id="proposal-deadline" name="deadline" minLength="2" maxLength="200" value={form.deadline} onChange={e => update('deadline',e.target.value)} placeholder={t('deadlineHint')} required/></Field><Field label={t('prototype')} name="proposal-link" required><input id="proposal-link" name="link" type="url" spellCheck="false" maxLength="2000" value={form.link} onChange={e => update('link',e.target.value)} placeholder={t('prototypeHint')} required/></Field></div>
-    <ErrorBox title={t('error')} error={error}/><BusyButton type="submit" className="button primary" busy={busy} busyText={t('sending')}>{t('sendProposal')}<Icon name="arrow" size={17}/></BusyButton>
+    </fieldset><ErrorBox title={t('error')} error={error}/><BusyButton type="submit" className="button primary" busy={busy} busyText={t('sending')}>{t('sendProposal')}<Icon name="arrow" size={17}/></BusyButton>
   </form>;
 }
 
 const blankDraft = restoreDraft();
-function getSavedDraft() { try { return restoreDraft(JSON.parse(localStorage.getItem('sana-draft-v2') || '{}')); } catch { return restoreDraft(); } }
 
 function Editor({ drafts = [], t, language, navigate, notify, onUpdate }) {
-  const [draft, setDraft] = useState(getSavedDraft);
+  const [draft, setDraft, storageFailed] = useSavedForm('sana-draft-v2', restoreDraft, restoreDraft);
   const [seedChoice, setSeedChoice] = useState(draft.seedId);
-  const [busy, setBusy] = useState(false);
+  const [writeBusy, setBusy] = useState(false);
+  const job = useJob('editor');
+  const analysisLabel = t(analysisBusyKey(job));
+  const busy = writeBusy || jobIsPending(job);
   const [error, setError] = useState('');
   const [confirmed, setConfirmed] = useState(false);
   const edited = draftHasEdits(draft);
   const [operation, setOperation] = useState('analyze');
   const [usedDemo, setUsedDemo] = useState(false);
+  const [recovered, setRecovered] = useState(false);
   const sourceRef = useRef(null);
-  useEffect(() => { try { localStorage.setItem('sana-draft-v2', JSON.stringify(restoreDraft(draft))); } catch { /* Browser storage may be unavailable. The current draft remains in memory. */ } }, [draft]);
+  useLeaveWarning(writeBusy || storageFailed, t(writeBusy ? 'writePendingWarning' : 'storageWarning'));
+  useEffect(() => {
+    if (job?.status === 'failed') { setError(job.error || t('analysisError')); return; }
+    if (job?.status !== 'succeeded') return;
+    const completed = completedDraftPatch(draft, job);
+    if (completed) {
+      setDraft(current => ({ ...current, ...completed }));
+      setConfirmed(false); setError(''); setRecovered(true);
+    } else setError(t('staleJob'));
+    analysisJobs.clear('editor');
+  }, [job]);
   const patch = values => setDraft(old => ({...old,...values}));
   const selectedSeed = drafts.find(seed => seed.id === draft.seedId);
   const seedAnswers = selectedSeed?.answers || {};
   const loadSeed = () => {
     const selected = drafts.find(seed => seed.id === seedChoice);
     if (!selected) return;
+    analysisJobs.clear('editor'); setRecovered(false);
     setDraft({...blankDraft,text:selected.text,topic:selected.topic || '',seedId:selected.id}); setConfirmed(false); setError(''); setUsedDemo(false);
     sourceRef.current?.focus();
   };
   const reset = () => {
     if (draft.text && !window.confirm(t('resetConfirm'))) return;
+    analysisJobs.clear('editor'); setRecovered(false);
     setDraft({...blankDraft}); setSeedChoice(''); setConfirmed(false); setError(''); setUsedDemo(false);
   };
-  const analyze = async ({ offline = false, stage = 1, answers = answersForAnalysis(draft) } = {}) => {
-    if (draft.text.trim().length < 20) { setError(t('minDraft')); sourceRef.current?.focus(); return; }
-    setBusy(true); setOperation('analyze'); setError('');
-    try {
-      const result = await api('/analyze', { method:'POST', body: {draft:draft.text, answers, language, offline} });
-      patch(analysisSuccessPatch(draft,result,answers,stage));
-      setConfirmed(false);
-    } catch (err) { setError(err.message); }
-    finally { setBusy(false); }
+  const analyze = ({ offline = false, stage = 1, answers = answersForAnalysis(draft) } = {}) => {
+    if (draft.text.trim().length < 12) { setError(t('minDraft')); sourceRef.current?.focus(); return; }
+    if (titleTooLong(answers)) { setError(t('titleTooLong')); return; }
+    setOperation('analyze'); setError(''); setRecovered(false);
+    analysisJobs.start('editor', { draft:draft.text, answers, language, offline }, { snapshot:draftSnapshot(draft), answers, stage });
   };
   const fillDemo = () => { patch({ answers: {...draft.answers,...seedAnswers} }); setUsedDemo(true); };
   const publish = async event => {
@@ -239,58 +300,97 @@ function Editor({ drafts = [], t, language, navigate, notify, onUpdate }) {
   return <>
     <div className="page-heading"><div><h1>{t('editorTitle')}</h1><p>{t('editorIntro')}</p></div>{draft.text && <button className="button ghost small" onClick={reset} disabled={busy}><Icon name="plus" size={16}/>{t('resetDraft')}</button>}</div>
     <ol className="steps">{['stageDraft','stageClarify','stagePublish'].map((key,index) => <li key={key} className={`${draft.stage === index ? 'current' : ''} ${draft.stage > index ? 'complete' : ''}`} aria-current={draft.stage === index ? 'step' : undefined}><span>{draft.stage > index ? <Icon name="check" size={15}/> : index+1}</span>{t(key)}{index < 2 && <Icon name="chevron" size={16}/>}</li>)}</ol>
+    <JobNotice job={job} t={t}/>
+    {recovered && <p className="form-save-note" role="status"><Icon name="checkCircle" size={15}/>{t('reviewReady')}</p>}
+    {storageFailed && <div className="notice error" role="alert"><Icon name="alert" size={18}/><p>{t('storageWarning')}</p></div>}
     <div className="editor-layout"><div className="editor-main">
       {draft.stage === 0 && <section className="draft-form panel"><h2>{t('source')}</h2><p className="form-intro">{t('sourceHint')}</p><div className="sample-picker"><label htmlFor="sample-draft"><Icon name="brief" size={16}/>{t('tryExample')}</label><div><select id="sample-draft" name="sample" value={seedChoice} onChange={e => setSeedChoice(e.target.value)}><option value="">{t('chooseExample')}</option>{drafts.map(seed => <option key={seed.id} value={seed.id}>{seed.title || seed.text.slice(0,75)}</option>)}</select><button className="button secondary small" disabled={!seedChoice || busy} onClick={loadSeed}>{t('useExample')}</button></div></div>
         <label htmlFor="draft-source" className="visually-hidden">{t('source')}</label><textarea ref={sourceRef} id="draft-source" name="draft" className="source-textarea" value={draft.text} onChange={e => setDraft(current => replaceDraftText(current,e.target.value))} rows="9" maxLength="12000" placeholder={t('sourcePlaceholder')} disabled={busy}/><div className="input-footer"><span><Icon name="check" size={13}/>{t('savedLocally')}</span><span>{draft.text.length.toLocaleString()} / 12,000</span></div>
-        <Field label={t('topic')} name="draft-topic"><input id="draft-topic" name="topic" value={draft.topic} onChange={e => patch({topic:e.target.value})} maxLength="80" placeholder={t('topicPlaceholder')} disabled={busy}/></Field><BusyButton className="button primary full-width" busy={busy} busyText={t('analyzing')} onClick={() => analyze()}><Icon name="sparkle" size={18}/>{t('analyze')}<Icon name="arrow" size={17}/></BusyButton>
+        <Field label={t('topic')} name="draft-topic"><input id="draft-topic" name="topic" value={draft.topic} onChange={e => patch({topic:e.target.value})} maxLength="80" placeholder={t('topicPlaceholder')} disabled={busy}/></Field><BusyButton className="button primary full-width" busy={busy} busyText={analysisLabel} onClick={() => analyze()}><Icon name="sparkle" size={18}/>{t('analyze')}<Icon name="arrow" size={17}/></BusyButton>
       </section>}
       {draft.stage > 0 && <div className="source-summary"><Icon name="brief" size={20}/><div><strong>{t('source')}</strong><p>{draft.text}</p></div><button className="icon-button" aria-label={t('backDraft')} disabled={busy} onClick={() => patch({stage:0})}><Icon name="edit" size={18}/></button></div>}
       {draft.stage === 1 && <section className="questions-section"><div className="section-heading"><div><h2>{t('questions')}</h2><p>{t('questionsHint')}</p></div></div>{Object.keys(seedAnswers).length > 0 && <div className="demo-fill"><button className="text-button" disabled={busy} onClick={fillDemo}><Icon name="brief" size={16}/>{t('demoAnswers')}</button><small>{t('seed')}</small></div>}{usedDemo && <div className="notice info compact"><Icon name="info" size={17}/><p>{t('demoAnswersNote')}</p></div>}
-        {(draft.analysis?.questions || []).map((question,index) => { const key = question.field || question.id; return <div className="question-block" key={question.id || index}><div className="question-title"><span>{index+1}</span><h3>{question.question || question.text}</h3>{question.max_points > 0 && <span className="question-weight">{question.max_points} {t('points',question.max_points)}</span>}</div>{question.why && <p className="question-reason">{question.why}</p>}<label htmlFor={`answer-${index}`} className="visually-hidden">{t('answer')}: {question.question}</label><textarea id={`answer-${index}`} name={key} rows="3" maxLength="4000" value={draft.answers[key] || ''} onChange={e => patch({answers:{...draft.answers,[key]:e.target.value}})} placeholder={question.answer_hint || `${t('answer')}…`} disabled={busy}/></div>; })}
-        <div className="editor-bottom-actions"><button className="button ghost" disabled={busy} onClick={() => patch({stage:0})}><Icon name="back" size={16}/>{t('backDraft')}</button><BusyButton className="button primary" busy={busy} busyText={t('analyzing')} onClick={() => analyze({stage:2,offline:draft.analysis?.mode === 'offline'})}>{t('buildCard')}<Icon name="arrow" size={17}/></BusyButton></div>
+        {(draft.analysis?.questions || []).map((question,index) => { const key = question.field || question.id; return <div className="question-block" key={question.id || index}><div className="question-title"><span>{index+1}</span><h3>{question.question || question.text}</h3>{question.max_points > 0 && <span className="question-weight">{question.max_points} {t('points',question.max_points)}</span>}</div>{question.why && <p className="question-reason">{question.why}</p>}<label htmlFor={`answer-${index}`} className="visually-hidden">{t('answer')}: {question.question}</label><textarea id={`answer-${index}`} name={key} rows="3" maxLength={fieldMaxLength(key)} value={draft.answers[key] || ''} onChange={e => patch({answers:{...draft.answers,[key]:e.target.value}})} placeholder={question.answer_hint || `${t('answer')}…`} disabled={busy}/></div>; })}
+        <div className="editor-bottom-actions"><button className="button ghost" disabled={busy} onClick={() => patch({stage:0})}><Icon name="back" size={16}/>{t('backDraft')}</button><BusyButton className="button primary" busy={busy} busyText={analysisLabel} onClick={() => analyze({stage:2,offline:draft.analysis?.mode === 'offline'})}>{t('buildCard')}<Icon name="arrow" size={17}/></BusyButton></div>
       </section>}
       {draft.stage === 2 && <form onSubmit={publish} className="review-form"><div className="section-heading"><div><h2>{t('reviewTitle')}</h2><p>{t('reviewIntro')}</p></div></div><div className="fields-editor">{fieldsOrder.map(key => <Field key={key} name={`card-${key}`} label={fieldLabels[language][key]}>{key === 'title' || key === 'contact' ? <input id={`card-${key}`} name={key} maxLength={key === 'title' ? 180 : 300} value={textValue(draft.fields[key])} onChange={e => {patch({fields:{...draft.fields,[key]:e.target.value}});setConfirmed(false);}} disabled={busy} placeholder={t('notProvided')}/> : <textarea id={`card-${key}`} name={key} rows={key === 'context' || key === 'need' ? 3 : 2} maxLength="4000" value={textValue(draft.fields[key])} onChange={e => {patch({fields:{...draft.fields,[key]:e.target.value}});setConfirmed(false);}} disabled={busy} placeholder={t('notProvided')}/>}</Field>)}</div>
-        {edited && <div className="notice info"><Icon name="info" size={18}/><div><p>{t('editsPending')}</p><BusyButton type="button" className="button secondary small" busy={busy} busyText={t('analyzing')} onClick={() => analyze({stage:2,offline:draft.analysis?.mode === 'offline'})}>{t('updateRating')}</BusyButton></div></div>}
+        {edited && <div className="notice info"><Icon name="info" size={18}/><div><p>{t('editsPending')}</p><BusyButton type="button" className="button secondary small" busy={busy} busyText={analysisLabel} onClick={() => analyze({stage:2,offline:draft.analysis?.mode === 'offline'})}>{t('updateRating')}</BusyButton></div></div>}
         <label className="confirmation"><input type="checkbox" checked={confirmed} onChange={e => setConfirmed(e.target.checked)} required disabled={busy}/><span>{t('confirm')}</span></label><div className="editor-bottom-actions"><button type="button" className="button ghost" onClick={() => patch({stage:1,answers:answersForAnalysis(draft)})} disabled={busy}><Icon name="back" size={16}/>{t('stageClarify')}</button><BusyButton type="submit" className="button primary" busy={busy} busyText={t('publishing')} disabled={!confirmed || edited}>{t('publish')}<Icon name="arrow" size={17}/></BusyButton></div>
       </form>}
-      <ErrorBox title={operation === 'publish' ? t('error') : t('analysisError')} error={error}>{operation !== 'publish' && <><button type="button" className="button secondary small" onClick={() => analyze({offline:true,stage:draft.stage === 0 ? 1 : draft.stage})} disabled={busy}>{t('offlineAction')}</button><small className="offline-explanation">{t('offlineNote')}</small></>}</ErrorBox>
-    </div><aside className="editor-aside">{busy ? <div className="analysis-progress"><span className="ai-loading-mark"><Mark size={38}/></span><h2>{t(operation === 'publish' ? 'publishing' : 'analyzing')}</h2><p>{t(operation === 'publish' ? 'publishedText' : 'analyzingHint')}</p><div className="skeleton-line"/><div className="skeleton-line short"/><div className="skeleton-line"/></div> : draft.analysis ? <>
-      <div className={`analysis-summary ${draft.analysis.mode === 'offline' ? 'offline' : ''}`}><span className="analysis-mode"><Icon name={draft.analysis.mode === 'offline' ? 'info' : 'sparkle'} size={17}/>{t(draft.analysis.mode === 'offline' ? 'offlineBadge' : 'aiBadge')}</span><h2>{t('summary')}</h2><p>{textValue(draft.analysis.summary)}</p></div><RatingPanel analysis={draft.analysis} initialScore={draft.initialScore ?? undefined} t={t} language={language} preview/>
+      <ErrorBox title={operation === 'publish' ? t('error') : t('analysisError')} error={error}>{operation !== 'publish' && <><div className="button-row"><button type="button" className="button primary small" onClick={() => analyze({stage:job?.meta?.stage || (draft.stage === 0 ? 1 : draft.stage)})} disabled={busy}>{t('retryAI')}</button><button type="button" className="button secondary small" onClick={() => analyze({offline:true,stage:job?.meta?.stage || (draft.stage === 0 ? 1 : draft.stage)})} disabled={busy}>{t('offlineAction')}</button></div><small className="offline-explanation">{t('offlineNote')}</small></>}</ErrorBox>
+    </div><aside className="editor-aside">{busy ? <div className="analysis-progress"><span className="ai-loading-mark"><Mark size={38}/></span><h2>{operation === 'publish' ? t('publishing') : analysisLabel}</h2><p>{t(operation === 'publish' ? 'publishedText' : job?.payload?.offline ? 'offlineNote' : 'analyzingHint')}</p><div className="skeleton-line"/><div className="skeleton-line short"/><div className="skeleton-line"/></div> : draft.analysis ? <>
+      <div className={`analysis-summary ${draft.analysis.mode === 'offline' ? 'offline' : ''}`}><span className="analysis-mode"><Icon name={draft.analysis.mode === 'offline' ? 'info' : 'sparkle'} size={17}/>{t(draft.analysis.mode === 'offline' ? 'offlineBadge' : 'aiBadge')}</span><h2>{t(draft.analysis.mode === 'offline' ? 'offlineSummary' : 'summary')}</h2><p>{textValue(draft.analysis.summary)}</p></div><RatingPanel analysis={draft.analysis} initialScore={draft.initialScore ?? undefined} t={t} language={language} preview/>
       {!!draft.analysis.warnings?.length && <div className="analysis-warnings">{draft.analysis.warnings.map((warning,index) => <p key={index}><Icon name="info" size={16}/>{textValue(warning)}</p>)}</div>}
       {!!draft.analysis.trace?.length && <details className="trace"><summary>{t('trace')}<Icon name="chevron" size={15}/></summary><ol>{draft.analysis.trace.map((step,index) => <li key={index}><span className="trace-dot"/><div><strong>{step.tool || step.name}</strong><p>{textValue(step.summary || step.result)}</p>{step.input_preview && <details className="trace-input"><summary>{t('traceInput')}<Icon name="chevron" size={13}/></summary><pre>{textValue(step.input_preview)}</pre></details>}{step.elapsed_ms >= 50 && <small>{(step.elapsed_ms/1000).toFixed(1)}s</small>}</div></li>)}</ol></details>}
     </> : <div className="analyst-intro"><span className="analyst-symbol"><Icon name="sparkle" size={25}/></span><h2>{t('analystTitle')}</h2><p>{t('analystText')}</p><div className="promise-list">{['message','chart','shield'].map((icon,index) => <div key={icon}><Icon name={icon} size={20}/><div><h3>{t(`promise${index+1}`)}</h3><p>{t(`promise${index+1}Text`)}</p></div></div>)}</div></div>}</aside></div>
   </>;
 }
 
-function Workspace({ data, route, navigate, t, language, onUpdate, notify }) {
+function Workspace(props) {
+  const owned = props.data.challenges.filter(task => task.is_owner);
+  const activeId = owned.some(item => item.id === props.route.id) ? props.route.id : owned[0]?.id;
+  return <WorkspaceForm key={activeId || 'empty'} {...props}/>;
+}
+function WorkspaceForm({ data, route, navigate, t, language, onUpdate, notify }) {
   const owned = data.challenges.filter(task => task.is_owner);
-  const [task, setTask] = useState(null);
-  const [busy, setBusy] = useState('');
-  const [error, setError] = useState('');
-  const [editing, setEditing] = useState(false);
-  const [fields, setFields] = useState({});
-  const [editAnalysis, setEditAnalysis] = useState(null);
-  const [editConfirmed, setEditConfirmed] = useState(false);
   const activeId = owned.some(item => item.id === route.id) ? route.id : owned[0]?.id;
+  const formKey = `sana-published-edit-${activeId}`;
+  const [edit, setEdit, storageFailed] = useSavedForm(formKey, { editing:false, fields:{}, analysis:null, baseVersion:null });
+  const [task, setTask] = useState(null);
+  const [writeBusy, setBusy] = useState('');
+  const jobChannel = `workspace:${activeId}`;
+  const job = useJob(jobChannel);
+  const analysisLabel = t(analysisBusyKey(job));
+  const busy = jobIsPending(job) ? 'analyze' : writeBusy;
+  const [error, setError] = useState('');
+  const { editing, fields, analysis: editAnalysis } = edit;
+  const setFields = fields => setEdit(old => ({...old,fields}));
+  const [editConfirmed, setEditConfirmed] = useState(false);
+  useLeaveWarning(Boolean(writeBusy) || storageFailed, t(writeBusy ? 'writePendingWarning' : 'storageWarning'));
   const refreshTask = useCallback(async () => { if (!activeId) { setTask(null); return; } const result = await api(`/challenges/${encodeURIComponent(activeId)}`); setTask(result.challenge || result); }, [activeId]);
-  useEffect(() => { setTask(owned.find(item => item.id === activeId) || null); setEditing(false); setEditAnalysis(null); setEditConfirmed(false); setError(''); refreshTask().catch(err => setError(err.message)); }, [activeId]);
+  useEffect(() => { setTask(owned.find(item => item.id === activeId) || null); setError(''); refreshTask().catch(err => setError(err.message)); }, [activeId]);
+  useEffect(() => {
+    if (job?.status === 'failed') { setError(job.error || t('analysisError')); return; }
+    if (job?.status !== 'succeeded') return;
+    if (job.meta.snapshot === inputSnapshot(fields) && job.meta.version === edit.baseVersion) {
+      setEdit(old => ({...old, analysis:job.analysis, fields:{...job.analysis.fields}}));
+      setEditConfirmed(false); setError('');
+    } else setError(t('staleJob'));
+    analysisJobs.clear(jobChannel);
+  }, [job]);
   const decision = async (proposalId,status) => { setBusy(proposalId);setError(''); try { await api(`/proposals/${encodeURIComponent(proposalId)}`,{method:'PATCH',body:{status}}); await refreshTask(); onUpdate(); notify(t('decisionSaved')); } catch(err) {setError(err.message);} finally {setBusy('');} };
   const editChanged = fieldsDiffer(fields,task?.fields);
   const editReviewed = Boolean(editAnalysis && !fieldsDiffer(fields,editAnalysis.fields));
-  const reviewEdits = async (offline = false) => {
-    setBusy('analyze');setError('');
-    try {const result = await api('/analyze',{method:'POST',body:{draft:task.draft || task.fields.context,answers:fields,language,offline}});setEditAnalysis(result);setFields(result.fields);setEditConfirmed(false);}
-    catch(err){setError(err.message);}finally{setBusy('');}
+  const staleEdit = editing && task && !task.summary && edit.baseVersion !== task.version;
+  const toggleEdit = () => {
+    if (editing && editChanged && !window.confirm(t('discardEdits'))) return;
+    setEdit({ editing:!editing, fields:editing ? {} : {...task.fields}, analysis:null, baseVersion:editing ? null : task.version });
+    setEditConfirmed(false); setError(''); analysisJobs.clear(jobChannel);
   };
-  const save = async event => {event.preventDefault();if(!editConfirmed || (editChanged && !editReviewed))return;setBusy('save');setError('');try {await api(`/challenges/${encodeURIComponent(task.id)}`,{method:'PATCH',body:{fields,confirmed:true,version:task.version,language,analysis_id:editReviewed?editAnalysis.analysis_id:undefined}});await refreshTask();onUpdate();setEditing(false);notify(t('changesSaved'));} catch(err){setError(err.message);} finally {setBusy('');}};
+  const reviewEdits = (offline = false) => {
+    if (titleTooLong(fields)) { setError(t('titleTooLong')); return; }
+    setError('');
+    analysisJobs.start(jobChannel, {draft:task.draft || task.fields.context,answers:fields,language,offline}, {snapshot:inputSnapshot(fields),version:edit.baseVersion});
+  };
+  const save = async event => {event.preventDefault();if(!editConfirmed || staleEdit || (editChanged && !editReviewed))return;setBusy('save');setError('');try {await api(`/challenges/${encodeURIComponent(task.id)}`,{method:'PATCH',body:{fields,confirmed:true,version:edit.baseVersion,language,analysis_id:editReviewed?editAnalysis.analysis_id:undefined}});setEdit({editing:false,fields:{},analysis:null,baseVersion:null});clearSaved(formKey);await refreshTask();onUpdate();notify(t('changesSaved'));} catch(err){setError(err.message);} finally {setBusy('');}};
   const proposals = task?.proposals || [];
   return <>
     <div className="page-heading"><div><h1>{t('workspaceTitle')}</h1><p>{t('workspaceIntro')}</p></div><NavLink view="editor" navigate={navigate} className="button primary"><Icon name="plus" size={18}/>{t('newTask')}</NavLink></div>
     {!owned.length ? <EmptyState icon="work" title={t('workspaceEmpty')} action={<NavLink view="editor" navigate={navigate} className="button primary">{t('newTask')}<Icon name="arrow" size={17}/></NavLink>}>{t('workspaceEmptyText')}</EmptyState> : <>
       <div className="workspace-toolbar"><Field label={t('myPublished')} name="workspace-task"><select id="workspace-task" value={activeId || ''} onChange={e => navigate('workspace',{id:e.target.value})}>{owned.map(item => <option key={item.id} value={item.id}>{item.title}</option>)}</select></Field><span className="workspace-count"><b>{owned.length}</b> {t('taskCount',owned.length)}</span></div>
-      <ErrorBox title={t('error')} error={error}/>
-      {task && <><div className="workspace-task-summary"><div><span className="topic-label">{task.topic}</span><h2>{task.title}</h2><div className="inline-meta"><Badge score={task.score} t={t}/><span>{proposals.length} {t('proposals',proposals.length)}</span></div></div><div className="button-row"><button className="button secondary small" disabled={!!busy} onClick={() => {setFields(task.fields || {});setEditAnalysis(null);setEditConfirmed(false);setEditing(!editing);}}><Icon name="edit" size={16}/>{t(editing?'cancel':'editTask')}</button><NavLink view="task" values={{id:task.id}} navigate={navigate} className="button ghost small">{t('openTask')}<Icon name="external" size={15}/></NavLink></div></div>
-      {editing ? <form className="workspace-edit" onSubmit={save}><div className="fields-editor">{fieldsOrder.map(key => <Field key={key} label={fieldLabels[language][key]} name={`edit-${key}`}><textarea id={`edit-${key}`} name={key} rows="2" maxLength="4000" value={fields[key] || ''} disabled={!!busy} onChange={e => {setFields({...fields,[key]:e.target.value});setEditConfirmed(false);}}/></Field>)}</div>{editChanged && !editReviewed && <div className="notice info"><Icon name="info" size={18}/><div><p>{t('ratingRequired')}</p><BusyButton type="button" className="button secondary small" busy={busy === 'analyze'} busyText={t('analyzing')} onClick={() => reviewEdits()}><Icon name="sparkle" size={16}/>{t('refreshAnalysis')}</BusyButton>{error && <><button className="button ghost small" type="button" onClick={() => reviewEdits(true)} disabled={!!busy}>{t('offlineAction')}</button><small className="offline-explanation">{t('offlineNote')}</small></>}</div></div>}{editAnalysis && <div className="workspace-review-score">{editAnalysis.mode === 'offline' && <p className="rating-source">{t('offlineBadge')}</p>}<RatingPanel analysis={editAnalysis} initialScore={task.score} t={t} language={language} preview/></div>}<label className="confirmation"><input type="checkbox" checked={editConfirmed} onChange={e => setEditConfirmed(e.target.checked)} required disabled={!!busy || (editChanged && !editReviewed)}/><span>{t('confirm')}</span></label><BusyButton className="button primary" type="submit" busy={busy === 'save'} busyText={t('saving')} disabled={!!busy || !editConfirmed || (editChanged && !editReviewed)}>{t('saveChanges')}<Icon name="check" size={17}/></BusyButton></form> : <><div className="section-heading proposals-heading"><div><h2>{t('compare')} <span className="count-pill">{proposals.length}</span></h2><p>{t('manualChoice')}</p></div><Icon name="users" size={23}/></div>
+      <ErrorBox title={t('error')} error={error}><button type="button" className="button secondary small" disabled={!!busy} onClick={() => {setError('');refreshTask().catch(err => setError(err.message));}}>{t('retry')}</button></ErrorBox>
+      <JobNotice job={job} t={t}/>
+      {editing && <p className={`form-save-note ${storageFailed ? 'storage-error' : ''}`} role="status"><Icon name={storageFailed ? 'alert' : 'check'} size={14}/>{t(storageFailed ? 'storageWarning' : 'editsSavedLocally')}</p>}
+      {staleEdit && <div className="notice error" role="alert"><Icon name="alert" size={18}/><p>{t('staleEdit')}</p></div>}
+      {task?.summary && !error && <Loading t={t}/>}
+      {task && !task.summary && <><div className="workspace-task-summary"><div><span className="topic-label">{task.topic}</span><h2>{task.title}</h2><div className="inline-meta"><Badge score={task.score} t={t}/><span>{proposals.length} {t('proposals',proposals.length)}</span></div></div><div className="button-row"><button className="button secondary small" disabled={!!busy} onClick={toggleEdit}><Icon name="edit" size={16}/>{t(editing?'cancel':'editTask')}</button><NavLink view="task" values={{id:task.id}} navigate={navigate} className="button ghost small">{t('openTask')}<Icon name="external" size={15}/></NavLink></div></div>
+      {editing ? <form className="workspace-edit" onSubmit={save}>
+        <div className="fields-editor">{fieldsOrder.map(key => <Field key={key} label={fieldLabels[language][key]} name={`edit-${key}`}><textarea id={`edit-${key}`} name={key} rows="2" maxLength={fieldMaxLength(key)} value={fields[key] || ''} disabled={!!busy} onChange={e => {setFields({...fields,[key]:e.target.value});setEditConfirmed(false);}}/></Field>)}</div>
+        {editChanged && !editReviewed && <div className="notice info"><Icon name="info" size={18}/><div><p>{t('ratingRequired')}</p><BusyButton type="button" className="button secondary small" busy={busy === 'analyze'} busyText={analysisLabel} disabled={staleEdit || !!busy} onClick={() => reviewEdits()}><Icon name="sparkle" size={16}/>{t('refreshAnalysis')}</BusyButton>{error && <><button className="button ghost small" type="button" onClick={() => reviewEdits(true)} disabled={!!busy || staleEdit}>{t('offlineAction')}</button><small className="offline-explanation">{t('offlineNote')}</small></>}</div></div>}
+        {editAnalysis && <div className="workspace-review-score">{editAnalysis.mode === 'offline' && <p className="rating-source">{t('offlineBadge')}</p>}<RatingPanel analysis={editAnalysis} initialScore={task.score} t={t} language={language} preview/></div>}
+        <label className="confirmation"><input type="checkbox" checked={editConfirmed} onChange={e => setEditConfirmed(e.target.checked)} required disabled={!!busy || staleEdit || (editChanged && !editReviewed)}/><span>{t('confirm')}</span></label>
+        <BusyButton className="button primary" type="submit" busy={busy === 'save'} busyText={t('saving')} disabled={!!busy || staleEdit || !editConfirmed || (editChanged && !editReviewed)}>{t('saveChanges')}<Icon name="check" size={17}/></BusyButton>
+      </form> : <><div className="section-heading proposals-heading"><div><h2>{t('compare')} <span className="count-pill">{proposals.length}</span></h2><p>{t('manualChoice')}</p></div><Icon name="users" size={23}/></div>
       {!proposals.length ? <EmptyState icon="message" title={t('noProposals')} action={<NavLink view="task" values={{id:task.id}} navigate={navigate} className="button secondary">{t('testProposal')}<Icon name="arrow" size={17}/></NavLink>}>{t('noProposalsText')}</EmptyState> : <div className="proposals-list">{proposals.map(proposal => <ProposalReview key={proposal.id} proposal={proposal} teams={data.teams} t={t} busy={busy === proposal.id} decision={decision} notify={notify} onUpdate={async () => {await refreshTask();onUpdate();}}/>)}</div>}</>}
       </>}
     </>}
@@ -333,6 +433,7 @@ export default function App() {
     catch(err) {setError(err.message);}
   },[]);
   useEffect(() => {refresh();},[refresh]);
+  useEffect(() => {analysisJobs.resume();},[]);
   useEffect(() => {document.documentElement.lang=language;try {localStorage.setItem('sana-language',language);}catch{}},[language]);
   useEffect(() => {document.title=`${route.view === 'task' ? t('taskDetails') : t(route.view === 'editor' ? 'editor' : route.view === 'workspace' ? 'workspace' : 'catalog')} — Sana`;},[route.view,language]);
   const ownedCount = data?.challenges.filter(task => task.is_owner).length || 0;

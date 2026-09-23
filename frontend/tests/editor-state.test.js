@@ -10,6 +10,30 @@ import {
 import { levelKey, translator } from '../src/i18n.js';
 import * as editorState from '../src/editor-state.js';
 
+test('clarification and published-edit field limits match the server title boundary', () => {
+  assert.equal(editorState.fieldMaxLength('title'),180);
+  for (const field of ['context','need','users','data','constraints','expected_result','success_criteria','contact','interaction_format']) {
+    assert.equal(editorState.fieldMaxLength(field),4000);
+  }
+});
+
+test('legacy long titles are rejected before analysis without silently truncating user text', () => {
+  const fields = {title:'Ә'.repeat(181),context:'This context remains untouched.'};
+  const original = structuredClone(fields);
+  assert.equal(editorState.titleTooLong(fields),true);
+  assert.deepEqual(fields,original);
+  assert.equal(editorState.titleTooLong({title:'Ә'.repeat(180)}),false);
+  assert.equal(editorState.titleTooLong({title:`  ${'Ә'.repeat(180)}  `}),false);
+  assert.equal(editorState.titleTooLong({}),false);
+  assert.equal(editorState.titleTooLong(null),false);
+});
+
+test('local checks use explicit non-AI headings in all supported languages', () => {
+  assert.equal(translator('ru')('offlineSummary'),'Локальная проверка');
+  assert.equal(translator('en')('offlineSummary'),'Local check');
+  assert.equal(translator('kk')('offlineSummary'),'Жергілікті тексеру');
+});
+
 function reviewedDraft() {
   const fields = { title: 'Библиотечный поиск', context: 'Студенты не находят учебники.', data: 'Каталог CSV', users: 'Студенты первого курса', contact: 'library@example.kz' };
   return {
