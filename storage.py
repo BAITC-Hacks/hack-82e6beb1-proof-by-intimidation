@@ -40,7 +40,7 @@ def load_state() -> dict[str, list[dict[str, Any]]]:
     return deepcopy(_seed_state())
 
 
-def save_state(state: dict[str, list[dict[str, Any]]]) -> None:
+def save_state(state: dict[str, list[ dict[str, Any] ]]) -> None:
     DATA_DIR.mkdir(exist_ok=True)
     with RUNTIME_FILE.open("w", encoding="utf-8") as handle:
         json.dump(state, handle, ensure_ascii=False, indent=2)
