@@ -1,0 +1,7 @@
+[
+  {"id":"team1","name":"Qadam Tech","interests":"EdTech, студенческие сервисы","skills":"Python, Streamlit, UX","technologies":"Python, SQLite"},
+  {"id":"team2","name":"Data Nomads","interests":"Аналитика данных","skills":"Pandas, визуализация, NLP","technologies":"Python, Plotly"},
+  {"id":"team3","name":"Bilim Makers","interests":"Обучение и доступность","skills":"UX research, frontend","technologies":"React, Figma"},
+  {"id":"team4","name":"Steppe AI","interests":"AI-ассистенты","skills":"LLM, backend, тестирование","technologies":"Python, OpenAI API"},
+  {"id":"team5","name":"Orken Studio","interests":"Коммуникации и сообщества","skills":"UI/UX, product","technologies":"Flutter, Firebase"}
+]

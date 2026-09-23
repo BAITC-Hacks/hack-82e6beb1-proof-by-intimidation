@@ -1,0 +1,7 @@
+[
+  {"id":"p1","task_id":"t1","team_id":"team1","idea":"Каталог с понятными статусами готовности и формой отклика.","plan":"Исследование → прототип → тестирование сценария.","deadline":"10 дней","link":"https://example.com/prototype-1","status":"submitted"},
+  {"id":"p2","task_id":"t1","team_id":"team3","idea":"Мобильный-first интерфейс каталога для студентов.","plan":"Wireframes → интерфейс → usability test.","deadline":"12 дней","link":"https://example.com/prototype-2","status":"submitted"},
+  {"id":"p3","task_id":"t2","team_id":"team5","idea":"Календарь со слотами преподавателей.","plan":"Схема → прототип → демонстрация.","deadline":"7 дней","link":"https://example.com/prototype-3","status":"submitted"},
+  {"id":"p4","task_id":"t3","team_id":"team2","idea":"Дашборд тематик и динамики обращений.","plan":"Очистка CSV → категории → графики.","deadline":"14 дней","link":"https://example.com/prototype-4","status":"submitted"},
+  {"id":"p5","task_id":"t5","team_id":"team4","idea":"AI-помощник по ресурсам библиотеки.","plan":"Сценарии → промпт → прототип.","deadline":"10 дней","link":"https://example.com/prototype-5","status":"submitted"}
+]
