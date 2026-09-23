@@ -276,6 +276,6 @@ Linux/macOS:
 
 | Git-аккаунт | Подтверждённые изменения |
 |---|---|
-| `ibrakhim2906` | Структура проекта (`e93ef47`), первая версия (`ef4d4ee`), финальные AI/UI и тесты (`147c21b`) |
-| `SlrLothar` | Frontend (`3e899cc`, `7fc8ff0`) |
-| `Beiba0404` | Architecture (`07e860f`) |
+| `ibrakhim2906` | Структура проекта, первая версия, финальные AI/UI и тесты |
+| `SlrLothar` | Frontend |
+| `Beiba0404` | Architecture |
