@@ -1,4 +1,4 @@
-# AI Sana Challenge Hub
+# Sana AI
 
 [Репозиторий команды](https://github.com/BAITC-Hacks/hack-82e6beb1-proof-by-intimidation) · Кейс МНВО — AI Sana: рейтинг качества бизнес-задач и открытый выбор команд.
 
