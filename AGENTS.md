@@ -136,7 +136,7 @@ Mandatory requirements first, working end to end, then documentation and reprodu
 - We may use `uv` locally for speed (`uv venv`, `uv pip install -r requirements.txt`), but `requirements.txt` + plain `python -m venv` + `pip install` MUST remain the documented, working install path. Never make `uv` (or a `uv.lock` / `pyproject.toml`-only setup) the only way to run the project — jurors may not have it.
 - OpenAI Python SDK. Model from env var `OPENAI_MODEL`, key from `OPENAI_API_KEY` (loaded via `python-dotenv`).
 - Budget is $50 of API credits: cheap model while developing, strong model for the final version. Avoid loops with many API calls.
-- UI: Streamlit (`app.py`). Logic lives in plain Python modules, not in the UI file.
+- UI: React + Vite (`frontend/`), Python FastAPI (`server/`) and SQLite, approved by the user for the rebuild on 23.09.2026. Keep the original Streamlit (`app.py`) runnable as a legacy version. Domain and AI logic stays in plain Python modules.
 - Storage: in-memory or local JSON/SQLite. No external services that a juror would need to set up.
 
 ## Cross-platform rules (we develop on Windows; jurors likely run Linux/macOS)
@@ -149,6 +149,9 @@ Mandatory requirements first, working end to end, then documentation and reprodu
 ## Project layout
 ```
 app.py            # Streamlit UI only — calls agent/
+frontend/         # React product UI, built by Vite
+server/           # FastAPI routes, validation and SQLite persistence
+agent/architect.py # New evidence-grounded AI briefing engine
 agent/core.py     # agent loop (plan -> tool calls -> check -> answer)
 agent/tools.py    # tool functions + their JSON schemas
 agent/prompts.py  # all system prompts in one place
@@ -160,7 +163,7 @@ README.md
 ```
 
 ## How to work
-- Small, focused changes. One feature per request. The app must start with `python -m streamlit run app.py` after every change.
+- Small, focused changes. The product must start with `python -m uvicorn server.app:app` after building `frontend/`; preserve `python -m streamlit run app.py` for the legacy version.
 - After each finished feature: the human RUNS it in the browser, then commits and pushes. Never let an hour pass with untracked files.
 - Never add `.env` to git, to a zip, or to anything shared. Secrets live only in `.env` locally.
 - Real AI calls are the default. Never hardcode results for the main scenario.

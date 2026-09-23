@@ -4,3 +4,10 @@ __pycache__/
 *.pyc
 .pytest_cache/
 data/runtime.json
+data/*.sqlite3
+data/*.sqlite3-*
+node_modules/
+frontend/dist/
+.qa/
+.venv-check/
+*.log
