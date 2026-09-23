@@ -4,6 +4,7 @@ import { criterionLabels, fieldLabels, fieldsOrder, levelKey, translator } from 
 import { answersForAnalysis, completedDraftPatch, draftHasEdits, draftSnapshot, fieldMaxLength, fieldsDiffer, replaceDraftText, restoreDraft, titleTooLong } from './editor-state.js';
 import { analysisBusyKey, analysisJobs, inputSnapshot, jobIsPending } from './analysis-jobs.js';
 import { clearSaved, readSaved, saveLocal, storageIsUnsaved } from './persistence.js';
+import { readinessSummary } from './catalog-summary.js';
 
 function useSavedForm(key, fallback, normalize = value => value) {
   const [value, update] = useState(() => normalize(readSaved(key, fallback)));
@@ -152,7 +153,7 @@ function RatingPanel({ analysis, initialScore, t, language, preview = false, com
   </section>;
 }
 
-function Catalog({ data, route, navigate, t }) {
+function Catalog({ data, route, navigate, t, language }) {
   const editorJob = useJob('editor');
   const [query, setQuery] = useState(route.q);
   useEffect(() => setQuery(route.q), [route.q]);
@@ -164,9 +165,12 @@ function Catalog({ data, route, navigate, t }) {
   }).sort((a, b) => b.score - a.score), [all, query, route.topic, route.level]);
   const updateFilter = (key, value) => navigate('catalog', { q: query, topic: route.topic, level: route.level, [key]: value }, true);
   const activeFilters = query || route.topic || route.level;
+  const readiness = readinessSummary(all);
+  const number = new Intl.NumberFormat(['ru','kk','en'].includes(language) ? language : 'ru');
   return <>
     {editorJob && <div className="catalog-job"><JobNotice job={editorJob} t={t}/><NavLink view="editor" navigate={navigate} className="text-button">{t(editorJob.status === 'succeeded' ? 'openReview' : 'returnDraft')}<Icon name="arrow" size={16}/></NavLink></div>}
     <div className="page-heading catalog-heading"><div><h1>{t('catalogTitle')}</h1><p>{t('catalogIntro')}</p></div><NavLink view="editor" navigate={navigate} className="button primary"><Icon name="plus" size={18}/>{t('newTask')}</NavLink></div>
+    <section className="readiness-overview" aria-label={t('readinessMap')}><div className="readiness-overview-label"><Icon name="chart" size={18}/><div><h2>{t('readinessMap')}</h2><p>{t('readinessMapHint')}</p></div></div><div className="readiness-levels">{readiness.map(level => <NavLink key={level.key} view="catalog" values={{q:query,topic:route.topic,level:route.level === level.key ? '' : level.key}} navigate={navigate} className={`readiness-level ${level.key} ${route.level === level.key ? 'selected' : ''}`} aria-current={route.level === level.key ? 'true' : undefined}><span className="readiness-level-name"><span className="status-dot"/>{t(level.key)}</span><strong>{number.format(level.count)}<small>{level.range}</small></strong></NavLink>)}</div></section>
     <div className="catalog-bar"><div className="catalog-tab">{t('allTasks')}<span>{all.length}</span></div><span className="catalog-sort"><Icon name="chart" size={16}/>{t('sort')}</span></div>
     <div className="filters"><div className="search-field"><Icon name="search" size={19}/><input aria-label={t('search')} type="search" name="search" autoComplete="off" placeholder={t('searchPlaceholder')} value={query} onChange={e => { setQuery(e.target.value); updateFilter('q', e.target.value); }}/></div><select aria-label={t('topic')} value={route.topic} onChange={e => updateFilter('topic', e.target.value)}><option value="">{t('allTopics')}</option>{topics.map(topic => <option key={topic}>{topic}</option>)}</select><select aria-label={t('readiness')} value={route.level} onChange={e => updateFilter('level', e.target.value)}><option value="">{t('allLevels')}</option>{['priority','ready','working','draft'].map(level => <option key={level} value={level}>{t(level)}</option>)}</select></div>
     {activeFilters && <div className="filter-results"><span>{tasks.length} {t('countOf')} {all.length} {t('taskCount',all.length)}</span><button className="text-button" onClick={() => navigate('catalog', {}, true)}>{t('clearFilters')}<Icon name="close" size={14}/></button></div>}
@@ -177,10 +181,10 @@ function Catalog({ data, route, navigate, t }) {
 
 function ChallengeCard({ task, navigate, t, featured }) {
   const fields = task.fields || task;
-  return <article className={`task-card ${featured ? 'featured' : ''}`}>
+  return <article className={`task-card ${levelKey(task.score)} ${featured ? 'featured' : ''}`}>
     <div className="task-card-top"><span className="topic-label">{task.topic || t('allTasks')}</span><Badge score={task.score} t={t}/></div>
-    <div className="task-card-body"><div className="task-copy"><h2><NavLink view="task" values={{id: task.id}} navigate={navigate}>{task.title || fields.title}</NavLink></h2><p className="task-context">{fields.context || fields.need || task.draft}</p>{featured && fields.expected_result && <div className="featured-result"><Icon name="checkCircle" size={18}/><div><span>{t('result')}</span><p>{fields.expected_result}</p></div></div>}</div><div className="task-score"><strong>{task.score}</strong><span>/ 100</span><small>{t('readiness')}</small></div></div>
-    {!featured && fields.expected_result && <p className="task-result"><span>{t('result')}</span>{fields.expected_result}</p>}
+    <div className="task-card-body"><div className="task-copy"><h2><NavLink view="task" values={{id: task.id}} navigate={navigate}>{task.title || fields.title}</NavLink></h2><p className="task-context">{fields.need || fields.context || task.draft}</p></div><div className="task-score" aria-label={`${t('readiness')}: ${task.score}/100`}><strong>{task.score}</strong><span>/ 100</span><small>{t('readiness')}</small><span className="task-score-track" aria-hidden="true"><i style={{width:`${Math.max(0,Math.min(100,Number(task.score) || 0))}%`}}/></span></div></div>
+    {fields.expected_result && <p className="task-result"><span><Icon name="checkCircle" size={14}/>{t('result')}</span>{fields.expected_result}</p>}
     <div className="task-card-footer"><div className="task-meta"><span><Icon name="users" size={16}/>{task.proposal_count ?? task.proposals?.length ?? 0} {t('proposals',task.proposal_count ?? task.proposals?.length ?? 0)}</span><span className="seed-label">{provenance(task,t)}</span></div><NavLink view="task" values={{ id: task.id }} navigate={navigate} className="task-open">{t('openTask')}<Icon name="arrow" size={17}/></NavLink></div>
   </article>;
 }

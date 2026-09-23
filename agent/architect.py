@@ -15,10 +15,10 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-from agent.architect_prompts import AUDIT_PROMPT, LANGUAGE_INSTRUCTIONS, OUTPUT_SCHEMA, REPAIR_PROMPT, SYSTEM_PROMPT
+from agent.architect_prompts import AUDIT_PROMPT, FACET_PROMPT, LANGUAGE_INSTRUCTIONS, OUTPUT_SCHEMA, REPAIR_PROMPT, SYSTEM_PROMPT
 from agent.evidence import compact, original_quote, resolve_spans, source_passages
 from agent.architect_tools import (
-    FIELDS, LANG_INDEX, RUBRIC, TOOL_SCHEMAS, compare_revision, get_rubric,
+    FACETS, FIELDS, LANG_INDEX, RUBRIC, TOOL_SCHEMAS, compare_revision, get_rubric,
     score_card_fields, source_for, verify_quotes,
 )
 
@@ -118,6 +118,11 @@ def _coverage_fields(raw: dict[str, Any], draft: str, answers: dict[str, str]) -
         labels = item.get("fields")
         if not isinstance(labels, list) or any(label not in FIELDS for label in labels) or len(set(labels)) != len(labels):
             raise AnalysisValidationError("coverage: use distinct supported field names")
+        existing_material = item.get("contains_existing_material", False)
+        if not isinstance(existing_material, bool):
+            raise AnalysisValidationError("coverage: existing material classification must be boolean")
+        if existing_material and "data" not in labels:
+            labels = [*labels, "data"]
         passage = passages[item["source_id"]]
         for field in labels:
             if field in answers or field == "title":
@@ -141,6 +146,53 @@ def _coverage_fields(raw: dict[str, Any], draft: str, answers: dict[str, str]) -
     return fields, evidence
 
 
+def _assess_requirements(raw: dict[str, Any], draft: str, answers: dict[str, str]) -> None:
+    """Derive semantic levels from a fixed, source-linked readiness checklist.
+
+    Older saved/mocked reviews remain readable. Live schema requires assessment.
+    The model classifies meaning; no domain keyword heuristic invents completeness.
+    """
+    passages = {item["id"]: item for item in source_passages(_sources(draft, answers))}
+    for item in raw.get("criteria", []) if isinstance(raw.get("criteria"), list) else []:
+        if not isinstance(item, dict) or "assessment" not in item:
+            continue
+        key, assessment = item.get("key"), item["assessment"]
+        if (key not in FACETS or not isinstance(assessment, list)
+            or len(assessment) != len(FACETS[key])
+            or any(not isinstance(facet, dict) for facet in assessment)
+            or {facet.get("id") for facet in assessment} != set(FACETS[key])):
+            raise AnalysisValidationError("assessment: return every fixed requirement for its criterion exactly once")
+        for facet in assessment:
+            ids, state = facet.get("source_ids"), facet.get("state")
+            if (state not in {"met", "partial", "missing", "blocked"}
+                or not isinstance(ids, list) or any(source_id not in passages for source_id in ids)
+                or (state == "missing" and ids) or (state != "missing" and not ids)):
+                raise AnalysisValidationError("assessment: met/partial/blocked requirements need original source IDs; missing needs none")
+            if not all(isinstance(facet.get(name), str) and facet[name].strip() and len(facet[name]) <= 700 for name in ("observation", "next_step")):
+                raise AnalysisValidationError("assessment: each requirement needs a concise observation and next step")
+            # Requirement evidence also repairs omissions in the general field
+            # mapping. Original passages and explicit owner answers stay intact.
+            if "coverage" in raw:
+                field = FACETS[key][facet["id"]][0]
+                for entry in raw["coverage"] if isinstance(raw["coverage"], list) else []:
+                    if isinstance(entry, dict) and entry.get("source_id") in ids and isinstance(entry.get("fields"), list) and field not in entry["fields"]:
+                        entry["fields"].append(field)
+        states = [facet["state"] for facet in assessment]
+        if "blocked" in states or all(state == "missing" for state in states):
+            level = 0
+        elif all(state == "met" for state in states):
+            level = 4
+        elif "met" in states:
+            level = 2 if "missing" in states else 3
+        else:
+            level = 1
+        priority = {"blocked": 0, "missing": 1, "partial": 2, "met": 3}
+        next_facet = min(assessment, key=lambda facet: priority[facet["state"]])
+        item.update(level=level, reason=" ".join(dict.fromkeys(facet["observation"].strip() for facet in assessment)), next_step=next_facet["next_step"].strip())
+        # Never retain a stale evidence quote from a model's old holistic score.
+        item.pop("evidence", None)
+
+
 def validate_analysis(raw: Any, draft: str, answers: dict[str, str], language: str = "ru") -> dict[str, Any]:
     """Validate content independently of the provider's JSON schema guarantees."""
     if not isinstance(raw, dict):
@@ -148,6 +200,7 @@ def validate_analysis(raw: Any, draft: str, answers: dict[str, str], language: s
     task_present = raw.get("task_present", True)
     if not isinstance(task_present, bool):
         raise AnalysisValidationError("task_present must be a boolean")
+    _assess_requirements(raw, draft, answers)
     coverage_mode = "coverage" in raw
     fields, coverage_evidence = _coverage_fields(raw, draft, answers) if coverage_mode else (_validate_fields(raw.get("fields"), draft, answers), None)
     summary = raw.get("summary")
@@ -240,9 +293,17 @@ def validate_analysis(raw: Any, draft: str, answers: dict[str, str], language: s
     if language == "kk" and not re.search(r"[ӘәҒғҚқҢңӨөҰұҮүҺһІі]", " ".join(prose)):
         raise AnalysisValidationError("use Kazakh, not Russian, for generated UI prose")
     rating = score_card_fields(fields, review, language)
+    for item in rating["criteria"]:
+        assessed = next(candidate for candidate in review if candidate["key"] == item["key"])
+        if "assessment" in assessed:
+            item["assessment"] = assessed["assessment"]
+            if item["level"] == 4:
+                item["next_step"] = _message(language, "Подтвердите эти сведения перед публикацией.", "Жариялаудан бұрын осы ақпаратты растаңыз.", "Confirm this information before publishing.")
     for question in questions:
         criterion = next((item for item in rating["criteria"] if question["field"] in RUBRIC[item["key"]]["fields"]), None)
         question["max_points"] = criterion["weight"] - criterion["points"] if criterion else 0
+        if question["max_points"] == 0:
+            question["priority"] = "medium"
     return {"summary": summary.strip(), "task_present": task_present, "fields": fields, "questions": questions, "warnings": warnings, "evidence": evidence, **rating}
 
 
@@ -344,8 +405,8 @@ def _input_preview(arguments: Any) -> dict[str, Any]:
 
 
 def _run(client: Any, model: str, draft: str, answers: dict[str, str], language: str) -> dict[str, Any]:
-    instructions = SYSTEM_PROMPT + "\n" + LANGUAGE_INSTRUCTIONS[language]
-    source_data = {"draft": draft, "answers": answers, "source_passages": source_passages(_sources(draft, answers)), "language": language, "score_is_preview": True}
+    instructions = SYSTEM_PROMPT + "\n" + LANGUAGE_INSTRUCTIONS[language] + "\n" + FACET_PROMPT
+    source_data = {"draft": draft, "answers": answers, "source_passages": source_passages(_sources(draft, answers)), "rubric": get_rubric(language), "language": language, "score_is_preview": True}
     conversation: list[Any] = [{"role": "user", "content": json.dumps(source_data, ensure_ascii=False)}]
     trace, calls_used, verified = [], 0, False
     output_text = ""
@@ -423,7 +484,7 @@ def _run(client: Any, model: str, draft: str, answers: dict[str, str], language:
     # reviewer to an earlier omitted field or incorrect grade.
     audit_input = [{"role": "user", "content": json.dumps({"original": source_data, "rubric": get_rubric(language)}, ensure_ascii=False)}]
     audit_started = time.perf_counter()
-    response = client.responses.create(model=model, instructions=instructions + "\n" + AUDIT_PROMPT + audit_feedback, input=audit_input,
+    response = client.responses.create(model=model, instructions=instructions + "\n" + AUDIT_PROMPT + "\n" + FACET_PROMPT + audit_feedback, input=audit_input,
         max_output_tokens=6500, store=False, temperature=0,
         text={"format": {"type": "json_schema", "name": "business_brief", "strict": True, "schema": OUTPUT_SCHEMA}})
     try:
@@ -434,7 +495,7 @@ def _run(client: Any, model: str, draft: str, answers: dict[str, str], language:
         repaired = True
         audit_input.extend(response.output)
         audit_input.append({"role": "user", "content": REPAIR_PROMPT + str(exc)[:700]})
-        response = client.responses.create(model=model, instructions=instructions + "\n" + AUDIT_PROMPT, input=audit_input,
+        response = client.responses.create(model=model, instructions=instructions + "\n" + AUDIT_PROMPT + "\n" + FACET_PROMPT, input=audit_input,
             max_output_tokens=6500, store=False, temperature=0,
             text={"format": {"type": "json_schema", "name": "business_brief", "strict": True, "schema": OUTPUT_SCHEMA}})
         result = validate_analysis(json.loads(response.output_text), draft, answers, language)

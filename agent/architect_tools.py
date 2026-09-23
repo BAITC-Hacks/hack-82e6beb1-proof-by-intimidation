@@ -25,6 +25,37 @@ RUBRIC = {
     "contact": {"weight": 10, "fields": ("contact", "interaction_format"), "labels": ("Связь с бизнесом", "Бизнеспен байланыс", "Business collaboration"), "complete": "A usable business contact/channel and an agreed feedback format/cadence are explicit."},
 }
 LANG_INDEX = {"ru": 0, "kk": 1, "en": 2}
+# Fixed, minimal readiness requirements. The model supplies evidence and states;
+# Python derives the level, so arbitrary holistic deductions cannot change it.
+FACETS = {
+    "context": {
+        "situation": ("context", "Current process and its concrete problem."),
+        "change": ("need", "The desired change in that process."),
+    },
+    "data": {
+        "materials": ("data", "Existing input artifacts/materials and their nature, format OR concrete example. Existing documents to revise are inputs too. Justified work needing no external data is valid."),
+        "access": ("data", "A realistic way to obtain/use the required materials WITHIN the stated project timeline. A supplied delivery channel answers this. Access only after the deadline is blocked, not partial."),
+    },
+    "expected_result": {
+        "deliverable": ("expected_result", "The bounded artifact the team hands over; stated formats are sufficient, never require a second format statement."),
+        "purpose": ("expected_result", "What that artifact must enable/do within the agreed scope. No technical implementation specification is required."),
+    },
+    "success_criteria": {
+        "check": ("success_criteria", "An observable acceptance action/outcome. Qualitative checks are valid; permanent universal guarantees are blocked."),
+        "verification": ("success_criteria", "How the business can check the stated outcome, e.g. a concrete trial, comparison or review. No numerical target or extra test set is mandatory."),
+    },
+    "constraints": {
+        "boundaries": ("constraints", "Applicable time/scope/privacy/access boundaries are stated and mutually feasible. No need to demand every possible type of constraint."),
+    },
+    "users": {
+        "group": ("users", "The relevant user role/group, without sensitive personal attributes."),
+        "action": ("users", "What that role needs to accomplish with the result."),
+    },
+    "contact": {
+        "channel": ("contact", "A usable business contact or communication channel."),
+        "feedback": ("interaction_format", "An agreed feedback/review format or cadence. Do not demand a calendar if the arrangement is already usable."),
+    },
+}
 READINESS = {
     "ru": ("Черновик", "Рабочая", "Готовая", "Приоритетная"),
     "kk": ("Бастапқы", "Жұмысқа жарамды", "Дайын", "Басым"),
@@ -45,7 +76,7 @@ def source_for(fields: dict[str, Any], criterion: str) -> str:
 def get_rubric(language: str = "ru") -> dict[str, Any]:
     idx = LANG_INDEX.get(language, 0)
     return {
-        "criteria": [{"key": key, "label": rule["labels"][idx], "weight": rule["weight"], "fields": list(rule["fields"]), "complete_requires": rule["complete"]} for key, rule in RUBRIC.items()],
+        "criteria": [{"key": key, "label": rule["labels"][idx], "weight": rule["weight"], "fields": list(rule["fields"]), "complete_requires": rule["complete"], "requirements": [{"id": name, "field": detail[0], "requirement": detail[1]} for name, detail in FACETS[key].items()]} for key, rule in RUBRIC.items()],
         "levels": {"0": "Absent, irrelevant, contradictory or explicit unknown.", "1": "Relevant mention, too vague to act on.", "2": "Specific useful information, with a major practical gap.", "3": "Actionable; a minor clarification remains.", "4": "Complete enough to begin work and verify the result for this criterion."},
         "formula": "points = floor(weight * level / 4 + 0.5); total = sum(points). No text-length bonus. Human confirmation is required before publishing points.",
     }

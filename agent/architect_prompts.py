@@ -1,6 +1,6 @@
 """System instructions and schema for AI Sana's source-grounded briefing agent."""
 
-from agent.architect_tools import FIELDS, FIELD_SCHEMA, REVIEW_SCHEMA, RUBRIC, STRING, object_schema
+from agent.architect_tools import FACETS, FIELDS, FIELD_SCHEMA, REVIEW_SCHEMA, RUBRIC, STRING, object_schema
 
 SYSTEM_PROMPT = """You are AI Sana's experienced business analyst. Help a business owner turn their actual problem into a useful student project. Be precise, warm and concise. All UI prose must use requested language (ru Russian, kk Kazakh, en English); exact source quotations remain unchanged.
 
@@ -41,17 +41,25 @@ QUESTION_SCHEMA = object_schema({
     "priority": {"type": "string", "enum": ["high", "medium"]},
     "max_points": {"type": "integer", "minimum": 0, "maximum": 20},
 })
+FACET_SCHEMA = object_schema({
+    "id": {"type": "string", "enum": list(dict.fromkeys(name for facets in FACETS.values() for name in facets))},
+    "source_ids": {"type": "array", "items": STRING},
+    "state": {"type": "string", "enum": ["met", "partial", "missing", "blocked"]},
+    "observation": STRING,
+    "next_step": STRING,
+})
 OUTPUT_SCHEMA = object_schema({
     "summary": STRING,
     "task_present": {"type": "boolean"},
     "title": STRING,
-    "coverage": {"type": "array", "items": object_schema({"source_id": STRING, "fields": {"type": "array", "items": {"type": "string", "enum": list(FIELDS)}}})},
-    "questions": {"type": "array", "items": QUESTION_SCHEMA},
+    "coverage": {"type": "array", "items": object_schema({"source_id": STRING, "contains_existing_material": {"type": "boolean"}, "fields": {"type": "array", "items": {"type": "string", "enum": list(FIELDS)}}})},
     "criteria": {"type": "array", "items": object_schema({
-        **{key: value for key, value in REVIEW_SCHEMA["properties"].items() if key != "evidence"},
+        "key": {"type": "string", "enum": list(RUBRIC)},
         "status": {"type": "string", "enum": ["usable", "missing", "unknown", "irrelevant", "contradictory", "unverifiable"]},
+        "assessment": {"type": "array", "items": FACET_SCHEMA},
     })},
     "contradictions": {"type": "array", "items": object_schema({"source_ids": {"type": "array", "items": STRING}, "criteria": {"type": "array", "items": {"type": "string", "enum": list(RUBRIC)}}, "description": STRING})},
+    "questions": {"type": "array", "items": QUESTION_SCHEMA},
     "warnings": {"type": "array", "items": STRING},
 })
 REPAIR_PROMPT = "The previous proposed answer failed validation. Correct the listed problems once. Preserve source facts verbatim, do not fill missing facts. Recheck language, exactly seven criteria and 3–5 distinct relevant questions. Return only corrected JSON. Validation errors: "
@@ -65,6 +73,18 @@ First decide task_present and each criterion's status. Reject the grading value 
 5. Check material coverage by role, not by its position in the sentence: an EXISTING artifact to be revised, reviewed or repaired is an input/material, even when the same passage specifies the desired deliverable. Include that passage in data as well as the other appropriate fields. Do not confuse an existing artifact with a proposed new one.
 6. Before deducting any points, verify the claimed missing detail is actually absent from ALL supplied answers. Named file formats already answer the format question; a supplied delivery channel already answers how materials will be shared; a specified lookup key already answers how the user finds a record. Never demand a second restatement. Optional refinements (file naming, extra examples, extra edge cases, visual layout) do not justify lowering an otherwise workable criterion. Level4 means sufficient to begin and verify THIS scoped work, not exhaustive enterprise specifications. For each deduction name only a consequential unsupplied rubric requirement; if none exists, use level4 and a confirmation step. Validation questions may still carry zero potential points.
 Return only the corrected JSON, without audit reasoning or hidden chain of thought."""
+
+# Last instruction deliberately replaces holistic level/reason generation. The
+# strict schema makes the source-backed checklist precede questions, which must
+# not manufacture deductions merely to satisfy the three-question minimum.
+FACET_PROMPT = """EVIDENCE-FIRST GRADING CONTRACT (authoritative over earlier level/reason instructions)
+Before assigning generic fields, answer the separate binary source-inventory question for EVERY passage: contains_existing_material=true only if it identifies an already-existing artifact/source to inspect, revise, use or obtain for this task. Its access may be unknown or blocked; that affects readiness, not the fact that it exists. A request to revise/review an existing artifact IS true even when phrased as the desired task. A future artifact that students must create is false. Pure instructions to the AI are false. Python additionally routes true passages to data; explicit data answers/clears still override this. This inventory decision is separate from the passage's other fields.
+Do NOT output or choose a holistic level, reason or score in final criteria. For each criterion return assessment: exactly the requirement IDs from rubric.requirements, in their listed order. For EACH requirement first collect all supporting source_ids from ALL original draft and answer passages, then judge its state and write one short observation grounded in those IDs. A relevant passage may be cited by multiple requirements and assigned to multiple card fields. Existing artifacts being changed/reviewed are materials, even when mentioned alongside the requested new deliverable.
+States: met = sufficient for this scoped work; partial = supplied but genuinely vague/incomplete; missing = no relevant information anywhere; blocked = infeasible or internally contradictory, including required materials arriving after the deadline or untestable absolute acceptance. Do not mark access met merely because a late date is precise. Check the deadline and data availability together before judging data.access. A non-task has no met requirements.
+Each met/partial/blocked requirement MUST cite original source IDs; missing has no source IDs. observation must say the actual supplied fact, and only a consequential unsupplied requirement if there is one. next_step is the smallest action resolving that actual gap; for met write a short confirmation. Never ask to restate a supplied delivery method or format. Optional extra examples, file naming, additional metrics and enterprise implementation detail are not requirements. A supplied qualitative review can meet both success facets. A criterion can be fully ready with concise information.
+Python derives level: all met=4; met+partial without missing=3; some met and some missing=2; vague partial only=1; all missing or any blocked=0. Unsupported states cannot earn credit. Thus a minimum of three questions does NOT imply three deductions. Generate questions only AFTER assessment: when complete, ask validation questions with no implied missing facts; zero potential points is legitimate. Do not create a fictitious gap to justify a question.
+Compact localized prose: observations and next_steps should be one short sentence, usually under 160 characters each. No chain of thought or hidden reasoning in output.
+"""
 
 LANGUAGE_INSTRUCTIONS = {
     "ru": "ОБЯЗАТЕЛЬНО: summary, все questions, why, answer_hint, reason, next_step и warnings пишите ПО-РУССКИ. Дословные поля и цитаты сохраняйте как в источнике.",

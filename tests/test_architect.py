@@ -10,7 +10,7 @@ from agent.architect import (
     AnalysisUnavailable, AnalysisValidationError, _input_preview, _run, analyze_brief,
     score_card_fields, validate_analysis,
 )
-from agent.architect_tools import FIELDS, RUBRIC, get_rubric, verify_quotes
+from agent.architect_tools import FACETS, FIELDS, RUBRIC, get_rubric, verify_quotes
 from agent.evidence import original_quote, resolve_spans, source_passages
 
 
@@ -489,3 +489,109 @@ def test_derived_evidence_can_exceed_the_tool_claim_limit():
     claims = [{"field": "context", "source": "draft", "quote": DRAFT} for _ in range(50)]
     assert verify_quotes(claims, {"draft": DRAFT})["valid"]
     assert not verify_quotes(claims, {"draft": DRAFT}, max_claims=40)["valid"]
+
+
+def assessed_result(draft, assignment=None):
+    raw = coverage_result(draft, assignment=assignment)
+    for criterion in raw["criteria"]:
+        criterion.update(status="usable", assessment=[{
+            "id": key, "source_ids": [], "state": "missing",
+            "observation": "This specific requirement is not supplied.",
+            "next_step": "Supply this requirement before beginning work.",
+        } for key in FACETS[criterion["key"]]])
+    return raw
+
+
+@pytest.mark.parametrize("states,level", [
+    (("met", "met"), 4), (("met", "partial"), 3),
+    (("met", "missing"), 2), (("partial", "missing"), 1),
+    (("partial", "partial"), 1), (("missing", "missing"), 0),
+    (("met", "blocked"), 0),
+])
+def test_fixed_requirements_determine_level_not_arbitrary_holistic_score(states, level):
+    raw = assessed_result(DRAFT)
+    criterion = next(item for item in raw["criteria"] if item["key"] == "data")
+    criterion.update(level=4, reason="Invented holistic reason must not survive.")
+    for facet, state in zip(criterion["assessment"], states):
+        facet.update(state=state, source_ids=[] if state == "missing" else ["s1"], observation="Source-backed assessment of the actual information.")
+    result = validate_analysis(raw, DRAFT, {}, "en")
+    actual = next(item for item in result["criteria"] if item["key"] == "data")
+    assert actual["level"] == level
+    assert "Invented" not in actual["reason"]
+
+
+def test_requirement_evidence_repairs_material_coverage_without_rewriting_source():
+    draft = "Volunteers revise the existing safety handbook. The manager emails it today."
+    raw = assessed_result(draft, {"s1": ["expected_result"], "s2": ["contact"]})
+    data = next(item for item in raw["criteria"] if item["key"] == "data")
+    for facet, source_id in zip(data["assessment"], ["s1", "s2"]):
+        facet.update(state="met", source_ids=[source_id], observation="The material and handoff are specified.", next_step="Confirm the supplied material and handoff.")
+    result = validate_analysis(raw, draft, {}, "en")
+    assert "existing safety handbook" in result["fields"]["data"]
+    assert "emails it today" in result["fields"]["data"]
+    assert next(item["points"] for item in result["criteria"] if item["key"] == "data") == 20
+    assert next(item["next_step"] for item in result["criteria"] if item["key"] == "data") == "Confirm this information before publishing."
+    question = next(item for item in result["questions"] if item["field"] == "data")
+    assert question["max_points"] == 0 and question["priority"] == "medium"
+
+
+def test_late_data_dependency_zeroes_data_even_with_named_material():
+    draft = "The report is due Monday. The source spreadsheet arrives Friday after that deadline."
+    raw = assessed_result(draft, {"s1": ["constraints"], "s2": ["data"]})
+    data = next(item for item in raw["criteria"] if item["key"] == "data")
+    data["assessment"][0].update(state="met", source_ids=["s2"], observation="The spreadsheet is named.")
+    data["assessment"][1].update(state="blocked", source_ids=["s1", "s2"], observation="The spreadsheet arrives after the report deadline.", next_step="Agree a feasible handoff date or project deadline.")
+    result = validate_analysis(raw, draft, {}, "en")
+    actual = next(item for item in result["criteria"] if item["key"] == "data")
+    assert actual["points"] == 0
+    assert actual["next_step"] == "Agree a feasible handoff date or project deadline."
+
+
+@pytest.mark.parametrize("defect", ["unknown_id", "no_evidence", "duplicate_requirement", "missing_with_evidence"])
+def test_invalid_requirement_assessments_are_rejected(defect):
+    raw = assessed_result(DRAFT)
+    assessment = raw["criteria"][0]["assessment"]
+    if defect == "unknown_id":
+        assessment[0].update(state="met", source_ids=["s999"])
+    elif defect == "no_evidence":
+        assessment[0].update(state="met", source_ids=[])
+    elif defect == "duplicate_requirement":
+        assessment[1] = copy.deepcopy(assessment[0])
+    else:
+        assessment[0].update(state="missing", source_ids=["s1"])
+    with pytest.raises(AnalysisValidationError, match="assessment"):
+        validate_analysis(raw, DRAFT, {}, "en")
+
+
+def test_requirement_mapping_cannot_override_an_explicit_cleared_field():
+    raw = assessed_result(DRAFT)
+    users = next(item for item in raw["criteria"] if item["key"] == "users")
+    for facet in users["assessment"]:
+        facet.update(state="met", source_ids=["s1"], observation="The original passage names the users.")
+    result = validate_analysis(raw, DRAFT, {"users": ""}, "en")
+    assert result["fields"]["users"] == ""
+    assert next(item["points"] for item in result["criteria"] if item["key"] == "users") == 0
+
+
+def test_existing_input_inventory_is_separate_from_future_deliverable():
+    draft = "Revise the existing shift manual. Produce a new checklist."
+    raw = coverage_result(draft, assignment={"s1": ["need"], "s2": ["expected_result"]})
+    raw["coverage"][0]["contains_existing_material"] = True
+    raw["coverage"][1]["contains_existing_material"] = False
+    result = validate_analysis(raw, draft, {}, "en")
+    assert result["fields"]["data"] == "Revise the existing shift manual."
+    assert "Produce a new checklist." not in result["fields"]["data"]
+
+
+def test_existing_input_inventory_respects_explicit_data_clear():
+    raw = coverage_result(DRAFT)
+    raw["coverage"][0]["contains_existing_material"] = True
+    result = validate_analysis(raw, DRAFT, {"data": ""}, "en")
+    assert result["fields"]["data"] == ""
+
+
+def test_existing_material_flag_must_be_boolean_not_a_truthy_string():
+    raw = coverage_result(DRAFT)
+    raw["coverage"][0]["contains_existing_material"] = "false"
+    with pytest.raises(AnalysisValidationError, match="boolean"):
+        validate_analysis(raw, DRAFT, {}, "en")
