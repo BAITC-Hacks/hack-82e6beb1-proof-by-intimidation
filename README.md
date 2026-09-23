@@ -272,20 +272,10 @@ Linux/macOS:
 
 Публичная версия не развёрнута. Локальный адрес: [http://127.0.0.1:8000](http://127.0.0.1:8000).
 
-## Подготовлено до хакатона / сделано на хакатоне
-
-До хакатона подготовлены `AGENTS.md` и инструкции в `.agents/skills`. Код, синтетические данные, тесты и документация разработаны для этого кейса; история Git фиксирует личные изменения участников. При разработке использовался AI-помощник Codex; AI-функции приложения вызывают модель через OpenAI API.
-
-Сторонние библиотеки перечислены выше и зафиксированы в зависимостях. Для интерфейса прочитаны [Impeccable](https://github.com/pbakaus/impeccable/blob/main/.agents/skills/impeccable/SKILL.md), [Anthropic Frontend Design](https://github.com/anthropics/skills/blob/main/skills/frontend-design/SKILL.md) и [Vercel Web Interface Guidelines](https://github.com/vercel-labs/web-interface-guidelines/blob/main/command.md). Их сторонние движки, установщики и хуки не установлены и не входят в приложение.
-
-По запросу команды визуальный ориентир финального каталога — [Kaggle Competitions](https://www.kaggle.com/competitions): спокойная боковая навигация, равнозначные карточки и компактные фильтры. Логотип, тексты и графические материалы Kaggle не копировались; бренд Sana и интерфейс реализованы в этом репозитории.
-
-Для процесса использованы [GOV.UK: изучение потребностей пользователей](https://www.gov.uk/service-manual/user-research/start-by-learning-user-needs), [OpenAI: Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs), [вызовы функций](https://developers.openai.com/api/docs/guides/function-calling) и [практики оценки](https://developers.openai.com/api/docs/guides/evaluation-best-practices). Формула рейтинга следует кейсу AI Sana; критерии приёмки и данные находятся в этом репозитории.
-
 ## Команда
 
 | Git-аккаунт | Подтверждённые изменения |
 |---|---|
 | `ibrakhim2906` | Структура проекта (`e93ef47`), первая версия (`ef4d4ee`), финальные AI/UI и тесты (`147c21b`) |
-| `SlrLothar` | Уточнения README (`3e899cc`, `7fc8ff0`) |
-| `Beiba0404` | Изменение README (`07e860f`) |
+| `SlrLothar` | Frontend (`3e899cc`, `7fc8ff0`) |
+| `Beiba0404` | Architecture (`07e860f`) |
